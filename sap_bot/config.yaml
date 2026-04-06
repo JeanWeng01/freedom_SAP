@@ -1,0 +1,17 @@
+sap_url: "https://your-sap-portal-url.com"   # Replace with actual SAP Fiori URL
+username: "your@email.com"                     # Replace with actual username
+password: "yourpassword"                       # Replace with actual password
+
+browser: "edge"                  # "edge" or "chrome"
+excel_path: "../SAP_bot.xlsx"    # relative to sap_bot/ folder, or absolute path
+pod_base_path: "C:\\Users\\jean\\Downloads\\"
+
+autonomous_interval_minutes: 15  # how often tiles 1 & 2 auto-run
+dry_run: true                    # SAFETY: if true, bot navigates but never clicks Submit/Confirm/Report
+
+# Step-through mode: pause before every destructive action (tiles 3 & 4)
+step_through: false
+
+# Screenshot settings
+screenshot_on_action: true       # take screenshot before/after destructive actions
+screenshot_on_error: true        # take screenshot on any error
