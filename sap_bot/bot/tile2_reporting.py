@@ -2,352 +2,501 @@
 
 Goal: For every item in "Events to Report", copy Planned Time into Final Time
 for every stop. Runs autonomously.
+
+Workflow per item:
+1. Click into the row (NOT the Report Final Time button) to open the detail page
+2. On the detail page, for EACH stop (usually 2):
+   a. Read the Planned Time (e.g. "Mar 16, 2026, 11:00PM UTC-5")
+   b. Click "Report Final Time" button in the Action column for that stop
+   c. In the popup: paste the date/time part (WITHOUT timezone) into Final Time field
+   d. Click "Report" in the popup
+   e. Wait for popup to close
+3. Only after ALL stops are done, click Back to return to the list
 """
 
 import re
 import logging
+import time as _time
 from selenium.webdriver.remote.webdriver import WebDriver
 from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
 from bot.utils import (
-    wait_for_element, wait_for_elements, wait_until_gone,
-    scroll_to_load_all, take_screenshot, destructive_action,
+    wait_for_element, wait_until_gone,
+    wait_for_page_ready, take_screenshot, destructive_action, click_tile,
 )
 
 log = logging.getLogger(__name__)
 
-# ── Timezone mapping ────────────────────────────────────────────────────────
-TZ_MAP = {
-    "EST": "UTC-5",
-    "EDT": "UTC-4",
-    "CST": "UTC-6",
-    "CDT": "UTC-5",
-    "MST": "UTC-7",
-    "MDT": "UTC-6",
-    "PST": "UTC-8",
-    "PDT": "UTC-7",
-    "UTC": "UTC+0",
-    "UTC-5": "UTC-5",
-    "UTC-4": "UTC-4",
-    "UTC-6": "UTC-6",
-}
-
-# ── Selectors ───────────────────────────────────────────────────────────────
-TILE_SELECTOR = (By.XPATH,
-    "//div[contains(@class,'sapUshellTile')]//span[contains(text(),'Freight Orders for Reporting')]"
-    "/ancestor::div[contains(@class,'sapUshellTile')]"
-)
-
-EVENTS_TO_REPORT_TAB = (By.XPATH,
-    "//*[contains(@class,'sapMITBFilter') or contains(@class,'sapMSegBBtn')]"
-    "//*[contains(text(),'Events to Report')]/.."
-)
-
-# Each freight order row in the "Events to Report" list
-ORDER_ROWS = (By.CSS_SELECTOR,
-    ".sapMListItems .sapMLIB, table tbody tr.sapUiTableRow, table tbody tr"
-)
-
-# "Report Final Time" button on each row in the list view
-REPORT_FINAL_TIME_BTN_ROW = (By.XPATH,
-    "//button[.//bdi[contains(text(),'Report Final Time')] or .//span[contains(text(),'Report Final Time')]]"
-)
-
-# Inside the per-order detail page: stop sections
-STOP_SECTIONS = (By.XPATH,
-    "//div[contains(@class,'sapUiForm') or contains(@class,'sapMPanel')]"
-    "[.//span[starts-with(text(),'Stop')]]"
-)
-
-# "Report Final Time" button per stop (in the Action column of the detail page)
-STOP_REPORT_BTN = (By.XPATH,
-    ".//button[.//bdi[contains(text(),'Report Final Time')] or .//span[contains(text(),'Report Final Time')]]"
-    " | .//a[contains(text(),'Report Final Time')]"
-)
-
-# Planned Time cell per event row in the detail page
-PLANNED_TIME_CELL = (By.XPATH,
-    ".//span[contains(text(),'Planned Time')]/../..//span[contains(@class,'sapMText') or contains(@class,'sapMLabel')]"
-    " | .//td[preceding-sibling::td[contains(.,'Planned Time')]]"
-)
-
-# Popup elements
-POPUP_FINAL_TIME_INPUT = (By.CSS_SELECTOR,
-    "input[id*='FinalTime'], input[id*='finalTime'], .sapMInputBaseInner[aria-label*='Final Time']"
-)
-POPUP_TIMEZONE_DROPDOWN = (By.CSS_SELECTOR,
-    "select[id*='TimeZone'], select[id*='timeZone'],"
-    " div[id*='TimeZone'] .sapMSlt, div[id*='timeZone'] .sapMSlt"
-)
-POPUP_REPORT_BUTTON = (By.XPATH,
-    "//footer//button[.//bdi[text()='Report']]"
-    " | //div[contains(@class,'sapMDialog')]//button[.//bdi[text()='Report']]"
-)
+TILE_NAME = "Freight Orders for Reporting"
 
 BACK_BUTTON = (By.CSS_SELECTOR,
-    ".sapMNavBack, button[title='Back'], .sapUshellShellHeadItm[title='Back']"
+    "button[title='Back'], .sapMNavBack, .sapUshellShellHeadItm[title='Back']"
 )
 
 
 def navigate_to_tile(driver: WebDriver):
     """Click the Freight Orders for Reporting tile."""
-    log.info("Navigating to Freight Orders for Reporting tile")
-    tile = wait_for_element(driver, *TILE_SELECTOR, timeout=30, clickable=True)
-    tile.click()
-    wait_for_element(driver, *EVENTS_TO_REPORT_TAB, timeout=30)
+    click_tile(driver, TILE_NAME)
+    wait_for_page_ready(driver)
+    take_screenshot(driver, "tile2_page_loaded")
     log.info("Tile 2 page loaded")
 
 
 def go_to_events_tab(driver: WebDriver):
-    """Switch to the 'Events to Report' tab."""
-    tab = wait_for_element(driver, *EVENTS_TO_REPORT_TAB, timeout=15, clickable=True)
-    tab.click()
-    log.info("Switched to 'Events to Report' tab")
-
-
-def parse_planned_time(raw_text: str) -> tuple[str, str] | None:
-    """Parse a Planned Time string like 'Mar 17, 2026, 12:00 AM EST' or 'Mar 16, 2026, 11:00PM UTC-5'.
-
-    Returns (datetime_str, timezone_label) or None if unparseable.
-    datetime_str example: 'Mar 17, 2026, 12:00 AM'
-    timezone_label example: 'EST' or 'UTC-5'
+    """Switch to the 'Events to Report' tab (handles soft hyphens)."""
+    js_click_tab = """
+    var spans = document.querySelectorAll('span');
+    for (var i = 0; i < spans.length; i++) {
+        var clean = spans[i].textContent.replace(/\\xAD/g, '').trim();
+        if (clean.indexOf('Events') !== -1 && clean.indexOf('Report') !== -1
+            && clean.indexOf('Reported') === -1) {
+            var clickable = spans[i].closest('[role="tab"], [class*="sapMITBFilter"], [class*="sapMITBItem"]');
+            if (clickable) { clickable.click(); return 'clicked'; }
+            spans[i].click();
+            return 'clicked';
+        }
+    }
+    return null;
     """
-    raw_text = raw_text.strip()
-
-    # Try pattern: "Mon DD, YYYY, HH:MM AM/PM TZ"
-    match = re.match(
-        r'^(.+\d{4},\s*\d{1,2}:\d{2}\s*(?:AM|PM)?)\s+((?:UTC[+-]?\d+|[A-Z]{2,5}))$',
-        raw_text, re.IGNORECASE
-    )
-    if match:
-        return match.group(1).strip(), match.group(2).strip().upper()
-
-    log.warning("Could not parse planned time: '%s'", raw_text)
-    return None
+    result = driver.execute_script(js_click_tab)
+    if result:
+        log.info("Clicked 'Events to Report' tab")
+        wait_for_page_ready(driver)
+        take_screenshot(driver, "tile2_events_tab")
+    else:
+        log.error("Could not find 'Events to Report' tab")
+        take_screenshot(driver, "tile2_events_tab_missing")
 
 
-def select_timezone_in_dropdown(driver: WebDriver, target_utc: str):
-    """Select the correct UTC offset in the timezone dropdown."""
-    # Try <select> element first
+def get_row_count(driver: WebDriver) -> int:
+    """Count visible rows in the Events to Report list."""
+    count = driver.execute_script("""
+        var rows = document.querySelectorAll('.sapMListItems .sapMLIB, .sapMListTblRow');
+        return rows.length;
+    """)
+    return count or 0
+
+
+def click_into_first_row(driver: WebDriver) -> bool:
+    """Click into the first row to open its detail page.
+
+    Must click a NON-LINK cell — clicking the freight order number link opens a new
+    browser tab with the wrong info. Click cells like 'Reporting Status' (text only)
+    or 'Drivers and License Plate' (often blank) instead. These trigger in-place
+    navigation to the reporting detail page.
+    """
+    url_before = driver.current_url
+
+    # Find the row via JS, then return its identifier so Selenium can click it
+    js_find_row = """
+    var rows = document.querySelectorAll(
+        '[role="row"].sapMListTblRow, ' +
+        '.sapMListItems .sapMLIB, ' +
+        '.sapMListTblRow'
+    );
+    var dataRows = [];
+    for (var i = 0; i < rows.length; i++) {
+        if (rows[i].closest('thead, [role="rowgroup"][class*="Hdr"]')) continue;
+        if (rows[i].classList.contains('sapMListTblHeader')) continue;
+        if (rows[i].textContent.trim().length > 0) dataRows.push(rows[i]);
+    }
+    if (dataRows.length === 0) return null;
+    return dataRows[0];
+    """
+    row_el = driver.execute_script(js_find_row)
+    if not row_el:
+        log.error("No data rows found")
+        take_screenshot(driver, "tile2_no_rows")
+        return False
+
+    # Strategy: try several click methods on the row itself (the .sapMLIB element
+    # has the press handler in SAP UI5). Use Selenium ActionChains for a real
+    # mouse click, which is what SAP UI5 listens for.
+    from selenium.webdriver.common.action_chains import ActionChains
+
+    # First try: Selenium native click on the row (real mouse event)
     try:
-        select_el = driver.find_element(*POPUP_TIMEZONE_DROPDOWN)
-        from selenium.webdriver.support.ui import Select
-        sel = Select(select_el)
-        for option in sel.options:
-            if target_utc in option.text:
-                sel.select_by_visible_text(option.text)
-                log.info("Selected timezone: %s", option.text)
-                return
-    except (NoSuchElementException, Exception):
-        pass
-
-    # Try SAP UI5 custom dropdown (click to open, then select)
-    try:
-        tz_trigger = driver.find_element(By.CSS_SELECTOR,
-            "div[id*='TimeZone'] .sapMSltArrow, div[id*='timeZone'] .sapMSltArrow,"
-            " span[id*='TimeZone'], span[id*='timeZone']"
-        )
-        tz_trigger.click()
-        # Find the option in the opened list
-        option = wait_for_element(driver, By.XPATH,
-            f"//li[contains(text(),'{target_utc}')] | //div[contains(@class,'sapMSltPicker')]//li[contains(text(),'{target_utc}')]",
-            timeout=10, clickable=True
-        )
-        option.click()
-        log.info("Selected timezone via dropdown: %s", target_utc)
-    except (TimeoutException, NoSuchElementException) as e:
-        log.error("Could not select timezone '%s': %s", target_utc, e)
-        take_screenshot(driver, f"tz_select_failed_{target_utc}")
-
-
-@destructive_action("Report Final Time for a stop")
-def click_report_in_popup(driver: WebDriver):
-    """Click the 'Report' button in the Final Time popup."""
-    take_screenshot(driver, "tile2_before_report")
-    btn = wait_for_element(driver, *POPUP_REPORT_BUTTON, timeout=10, clickable=True)
-    btn.click()
-    log.info("Clicked Report in popup")
-    # Wait for popup to close
-    wait_until_gone(driver, *POPUP_REPORT_BUTTON, timeout=15)
-    take_screenshot(driver, "tile2_after_report")
-
-
-def process_stop_event(driver: WebDriver, stop_element, stop_label: str,
-                       *, dry_run: bool = False):
-    """Process one stop's event: read Planned Time, open popup, fill, report."""
-    # Read Planned Time
-    try:
-        planned_el = stop_element.find_element(*PLANNED_TIME_CELL)
-        planned_raw = planned_el.text.strip()
-    except NoSuchElementException:
-        # Try broader search within the stop section
+        row_el.click()
+        log.info("Clicked row with native Selenium click")
+    except Exception as e:
+        log.warning("Native row click failed: %s — trying ActionChains", e)
         try:
-            cells = stop_element.find_elements(By.CSS_SELECTOR, "span, td")
-            planned_raw = None
-            for cell in cells:
-                text = cell.text.strip()
-                if re.search(r'\d{4}', text) and re.search(r'(?:AM|PM|UTC)', text, re.IGNORECASE):
-                    planned_raw = text
-                    break
-            if not planned_raw:
-                log.error("Could not find Planned Time for %s", stop_label)
-                take_screenshot(driver, f"planned_time_missing_{stop_label}")
-                return False
-        except Exception as e:
-            log.error("Error reading Planned Time for %s: %s", stop_label, e)
+            ActionChains(driver).move_to_element(row_el).click().perform()
+            log.info("Clicked row with ActionChains")
+        except Exception as e2:
+            log.error("ActionChains click also failed: %s", e2)
+            take_screenshot(driver, "tile2_click_failed")
             return False
 
-    log.info("%s — Planned Time: %s", stop_label, planned_raw)
+    # Verify navigation happened — wait up to 10 seconds for detail page indicators
+    _time.sleep(2)
+    wait_for_page_ready(driver)
 
-    parsed = parse_planned_time(planned_raw)
-    if parsed is None:
-        log.error("Unparseable Planned Time for %s: '%s'", stop_label, planned_raw)
-        take_screenshot(driver, f"unparseable_time_{stop_label}")
-        return False
-
-    datetime_str, tz_label = parsed
-    tz_utc = TZ_MAP.get(tz_label.upper())
-    if tz_utc is None:
-        log.warning("Unknown timezone '%s' for %s — skipping", tz_label, stop_label)
-        take_screenshot(driver, f"unknown_tz_{tz_label}_{stop_label}")
-        return False
-
-    # Click "Report Final Time" for this stop
-    try:
-        report_btn = stop_element.find_element(*STOP_REPORT_BTN)
-        report_btn.click()
-        log.info("Opened Report Final Time popup for %s", stop_label)
-    except NoSuchElementException:
-        log.error("'Report Final Time' button not found for %s", stop_label)
-        take_screenshot(driver, f"report_btn_missing_{stop_label}")
-        return False
-
-    # Fill the popup
-    try:
-        final_time_input = wait_for_element(driver, *POPUP_FINAL_TIME_INPUT, timeout=10)
-        final_time_input.clear()
-        final_time_input.send_keys(datetime_str)
-        log.info("Entered Final Time: %s", datetime_str)
-
-        select_timezone_in_dropdown(driver, tz_utc)
-
-        # Click Report
-        click_report_in_popup(driver, dry_run=dry_run)
+    url_after = driver.current_url
+    if url_after != url_before:
+        log.info("Navigation confirmed (URL changed: %s)", url_after[-60:])
         return True
 
-    except TimeoutException:
-        log.error("Popup elements not found for %s", stop_label)
-        take_screenshot(driver, f"popup_timeout_{stop_label}")
+    # Check for elements that ONLY exist on the detail page:
+    # - "Stop 1 - ..." stop headers
+    # - "Information" / "Reporting" / "Notes" tabs (detail page tabs)
+    # - "Reporting Status:" label (with colon, in detail header)
+    on_detail = driver.execute_script("""
+        // Look for "Stop N -" header text (specific to detail page)
+        var spans = document.querySelectorAll('span, h3, h4, div');
+        for (var i = 0; i < spans.length; i++) {
+            var clean = spans[i].textContent.replace(/\\xAD/g, '').trim();
+            if (/^Stop \\d+\\s*-/.test(clean)) return 'stop_header';
+        }
+        // Look for the detail page tabs: "Information", "Notes", "Drivers and License Plate"
+        var tabs = document.querySelectorAll('[role="tab"]');
+        for (var i = 0; i < tabs.length; i++) {
+            var clean = tabs[i].textContent.replace(/\\xAD/g, '').trim();
+            if (clean === 'Information' || clean === 'Contacts'
+                || clean === 'Drivers and License Plate') {
+                return 'detail_tabs';
+            }
+        }
+        return null;
+    """)
+
+    if on_detail:
+        log.info("Navigation confirmed (%s detected)", on_detail)
+        return True
+
+    log.error("Click did not navigate — still on events list page")
+    take_screenshot(driver, "tile2_click_no_nav")
+    return False
+
+
+def strip_timezone(planned_time: str) -> str:
+    """Strip the timezone suffix from a Planned Time string.
+
+    'Mar 16, 2026, 11:00PM UTC-5' → 'Mar 16, 2026, 11:00PM'
+    'Mar 17, 2026, 12:00 AM EST'  → 'Mar 17, 2026, 12:00 AM'
+    """
+    # Remove trailing timezone: UTC-5, UTC+0, EST, EDT, CST, etc.
+    stripped = re.sub(r'\s+(UTC[+-]?\d+|[A-Z]{2,5})\s*$', '', planned_time.strip())
+    return stripped.strip()
+
+
+def get_visible_report_buttons(driver):
+    """Return Selenium WebElements for all VISIBLE Report Final Time buttons on the page.
+
+    SAP Fiori is a SPA — old views remain in DOM but hidden. We filter to only
+    visible (offsetParent !== null and clientWidth > 0) elements.
+    """
+    return driver.execute_script("""
+        var visible = [];
+        var links = document.querySelectorAll('a, button');
+        for (var i = 0; i < links.length; i++) {
+            var el = links[i];
+            // Must be visible: offsetParent set and have layout
+            if (el.offsetParent === null) continue;
+            if (el.getClientRects().length === 0) continue;
+            var clean = el.textContent.replace(/\\xAD/g, '').trim();
+            if (clean === 'Report Final Time') visible.push(el);
+        }
+        return visible;
+    """)
+
+
+def get_visible_planned_times(driver) -> list[str]:
+    """Return planned time strings from VISIBLE elements only on the page."""
+    return driver.execute_script("""
+        var values = [];
+        var seen = new Set();
+        var nodes = document.querySelectorAll('span, td, [class*="sapMText"]');
+        for (var i = 0; i < nodes.length; i++) {
+            var el = nodes[i];
+            // Must be visible
+            if (el.offsetParent === null) continue;
+            if (el.getClientRects().length === 0) continue;
+            var t = el.textContent.trim();
+            // Match "Mon DD, YYYY, HH:MM[AM/PM] TZ" — date with AM/PM or UTC
+            if (!/[A-Z][a-z]{2} \\d{1,2}, \\d{4}/.test(t)) continue;
+            if (!/(AM|PM|UTC)/i.test(t)) continue;
+            if (t.length > 60) continue;
+            // Must be a leaf — no child has the same kind of content
+            var children = el.querySelectorAll('*');
+            var isLeaf = true;
+            for (var j = 0; j < children.length; j++) {
+                var ct = children[j].textContent.trim();
+                if (ct === t) { isLeaf = false; break; }
+                if (/(AM|PM|UTC)/i.test(ct) && /\\d{4}/.test(ct) && ct.length < 60) {
+                    isLeaf = false; break;
+                }
+            }
+            if (!isLeaf) continue;
+            // Avoid duplicates from the same exact value+position
+            var key = t + '@' + el.getBoundingClientRect().top;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            values.push(t);
+        }
+        return values;
+    """)
+
+
+def read_stop_data(driver: WebDriver) -> dict:
+    """Read VISIBLE Planned Time values and Report Final Time buttons on the detail page."""
+    btns = get_visible_report_buttons(driver)
+    times = get_visible_planned_times(driver)
+
+    # On the detail page, each stop has 1 Report button and 1 Planned Time
+    # The Planned Times list might also include "Final Time" empty cells — filter to ones that have content
+    log.info("Detail page (visible only): %d Report buttons, %d planned times", len(btns), len(times))
+    for i, t in enumerate(times):
+        log.info("  Planned time %d: '%s'", i, t)
+
+    return {'reportBtns': btns, 'plannedTimes': times, 'reportBtnCount': len(btns)}
+
+
+@destructive_action("Report Final Time in popup")
+def click_popup_report(driver: WebDriver):
+    """Click the 'Report' button inside the popup dialog."""
+    take_screenshot(driver, "tile2_popup_before_report")
+    btn = driver.execute_script("""
+        var dialogs = document.querySelectorAll('[class*="sapMDialog"], [role="dialog"]');
+        for (var i = 0; i < dialogs.length; i++) {
+            var btns = dialogs[i].querySelectorAll('button');
+            for (var j = 0; j < btns.length; j++) {
+                var clean = btns[j].textContent.replace(/\\xAD/g, '').trim();
+                if (clean === 'Report') return btns[j];
+            }
+        }
+        return null;
+    """)
+    if btn:
+        # Native click — same as row click and Report Final Time button
+        from selenium.webdriver.common.action_chains import ActionChains
+        try:
+            btn.click()
+            log.info("Clicked Report in popup (native)")
+        except Exception:
+            ActionChains(driver).move_to_element(btn).click().perform()
+            log.info("Clicked Report in popup (ActionChains)")
+        _time.sleep(2)
+        wait_for_page_ready(driver)
+        take_screenshot(driver, "tile2_popup_after_report")
+        return True
+    else:
+        log.error("Report button not found in popup")
+        take_screenshot(driver, "tile2_popup_no_report_btn")
         return False
 
 
-def process_order(driver: WebDriver, order_index: int,
-                  *, dry_run: bool = False) -> int:
-    """Process one freight order: open it, handle all stops, return stop count."""
-    # Click "Report Final Time" on the row to open the detail page
+def process_one_stop(driver: WebDriver, stop_index: int, planned_time_raw: str,
+                     *, dry_run: bool = False) -> bool:
+    """Click the Report Final Time button for one stop, fill the popup, click Report."""
+    datetime_only = strip_timezone(planned_time_raw)
+    log.info("Stop %d: Planned='%s' → Final Time='%s'", stop_index + 1, planned_time_raw, datetime_only)
+
+    # Re-fetch visible Report buttons (page may have updated)
+    visible_btns = get_visible_report_buttons(driver)
+    if stop_index >= len(visible_btns):
+        log.error("Stop %d index out of range (only %d visible Report buttons)",
+                  stop_index + 1, len(visible_btns))
+        take_screenshot(driver, f"tile2_btn_oor_stop{stop_index+1}")
+        return False
+
+    btn = visible_btns[stop_index]
+
+    # Use Selenium native click (real mouse event, not JS) — same trick as the row click
+    from selenium.webdriver.common.action_chains import ActionChains
     try:
-        buttons = driver.find_elements(*REPORT_FINAL_TIME_BTN_ROW)
-        if order_index >= len(buttons):
-            log.warning("Order index %d out of range (found %d buttons)", order_index, len(buttons))
-            return 0
-        buttons[order_index].click()
-        log.info("Opened freight order detail page (index %d)", order_index)
-    except (IndexError, NoSuchElementException) as e:
-        log.error("Could not open order at index %d: %s", order_index, e)
+        # Scroll into view first
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
+        _time.sleep(0.5)
+        btn.click()
+        log.info("Clicked Report Final Time for stop %d (native click)", stop_index + 1)
+    except Exception as e:
+        log.warning("Native click failed: %s — trying ActionChains", e)
+        try:
+            ActionChains(driver).move_to_element(btn).click().perform()
+            log.info("Clicked Report Final Time for stop %d (ActionChains)", stop_index + 1)
+        except Exception as e2:
+            log.error("All click methods failed for stop %d: %s", stop_index + 1, e2)
+            take_screenshot(driver, f"tile2_btn_click_failed_stop{stop_index+1}")
+            return False
+    _time.sleep(1)
+    wait_for_page_ready(driver)
+    take_screenshot(driver, f"tile2_popup_stop{stop_index+1}")
+
+    # Find the Final Time input field in the popup
+    final_input = driver.execute_script("""
+        var dialogs = document.querySelectorAll('[class*="sapMDialog"], [role="dialog"]');
+        for (var i = 0; i < dialogs.length; i++) {
+            if (dialogs[i].offsetParent === null) continue;  // skip hidden dialogs
+            var inputs = dialogs[i].querySelectorAll('input:not([type="hidden"])');
+            for (var j = 0; j < inputs.length; j++) {
+                if (inputs[j].offsetParent !== null) return inputs[j];
+            }
+        }
+        return null;
+    """)
+
+    if not final_input:
+        log.error("Final Time input not found in popup for stop %d", stop_index + 1)
+        take_screenshot(driver, f"tile2_no_input_stop{stop_index+1}")
+        # Try to close popup
+        driver.execute_script("""
+            var dialogs = document.querySelectorAll('[class*="sapMDialog"], [role="dialog"]');
+            for (var i = 0; i < dialogs.length; i++) {
+                var cancelBtn = dialogs[i].querySelector('button');
+                if (cancelBtn) { cancelBtn.click(); break; }
+            }
+        """)
+        return False
+
+    # Clear and type the datetime
+    final_input.click()
+    _time.sleep(0.3)
+    final_input.clear()
+    final_input.send_keys(datetime_only)
+    log.info("Entered Final Time: '%s'", datetime_only)
+    _time.sleep(0.5)
+    take_screenshot(driver, f"tile2_filled_stop{stop_index+1}")
+
+    # Skip timezone — leave it as default (always the same fixed timezone)
+
+    # Click Report in the popup (or close it in dry run)
+    result = click_popup_report(driver, dry_run=dry_run)
+
+    if result is None:
+        # Dry run — popup is still open, need to close it
+        log.info("Dry run — closing popup via Cancel")
+        driver.execute_script("""
+            var dialogs = document.querySelectorAll('[class*="sapMDialog"], [role="dialog"]');
+            for (var i = dialogs.length - 1; i >= 0; i--) {
+                if (dialogs[i].offsetParent === null) continue;
+                var btns = dialogs[i].querySelectorAll('button');
+                for (var j = 0; j < btns.length; j++) {
+                    var t = btns[j].textContent.replace(/\\xAD/g, '').trim();
+                    if (t === 'Cancel' || t === 'Close') { btns[j].click(); return; }
+                }
+                // Last resort — click any button to dismiss
+                if (btns.length > 0) btns[btns.length - 1].click();
+                return;
+            }
+        """)
+        _time.sleep(1)
+        wait_for_page_ready(driver)
+
+    return True
+
+
+def process_detail_page(driver: WebDriver, *, dry_run: bool = False) -> int:
+    """Process all stops on the detail page. Returns number of stops processed."""
+    wait_for_page_ready(driver)
+    take_screenshot(driver, "tile2_detail_page")
+
+    data = read_stop_data(driver)
+
+    if data['reportBtnCount'] == 0:
+        log.warning("No Report Final Time buttons found on detail page")
         return 0
 
-    # Wait for detail page to load — look for stop sections
-    try:
-        # Find all stop sections (Stop 1, Stop 2, etc.)
-        from selenium.webdriver.support.ui import WebDriverWait
-        WebDriverWait(driver, 15).until(
-            lambda d: len(d.find_elements(By.XPATH,
-                "//span[starts-with(text(),'Stop ') or starts-with(text(),'Stop')]"
-            )) > 0
-        )
-    except TimeoutException:
-        log.error("Detail page did not load stops for order index %d", order_index)
-        take_screenshot(driver, f"tile2_detail_no_stops_{order_index}")
-        # Navigate back
-        try:
-            driver.find_element(*BACK_BUTTON).click()
-        except NoSuchElementException:
-            driver.back()
-        return 0
+    # We need one planned time per Report button
+    # The planned times list may contain extra values (Final Time column etc.)
+    # But we expect the first N planned times to correspond to the N stops
+    planned_times = data['plannedTimes']
+    btn_count = data['reportBtnCount']
 
-    # Find stop sections — look for sections containing "Stop N"
-    stop_containers = driver.find_elements(By.XPATH,
-        "//div[contains(@class,'sapUiForm') or contains(@class,'sapMPanel') or contains(@class,'sapUiRGrp')]"
-        "[.//span[contains(text(),'Stop ')]]"
-    )
+    if len(planned_times) < btn_count:
+        log.warning("Fewer planned times (%d) than Report buttons (%d)",
+                     len(planned_times), btn_count)
 
-    if not stop_containers:
-        # Fallback: try to find event rows directly
-        stop_containers = driver.find_elements(By.XPATH,
-            "//table[.//th[contains(text(),'Event') or contains(text(),'Planned')]]"
-            "//tbody/tr"
-        )
+    # Cache planned times upfront — do NOT re-scan after each stop, as the popup
+    # interaction can change what's visible and corrupt the readings
+    cached_times = list(planned_times)
+    log.info("Cached planned times for all stops: %s", cached_times)
 
-    stops_processed = 0
-    for i, stop_el in enumerate(stop_containers):
-        stop_label = f"Stop {i + 1}"
-        try:
-            label_el = stop_el.find_element(By.XPATH, ".//span[contains(text(),'Stop ')]")
-            stop_label = label_el.text.strip()[:30]
-        except NoSuchElementException:
-            pass
+    stops_done = 0
 
-        log.info("Processing %s", stop_label)
-        success = process_stop_event(driver, stop_el, stop_label, dry_run=dry_run)
+    for i in range(btn_count):
+        if i >= len(cached_times):
+            log.error("No planned time for stop %d — skipping", i + 1)
+            take_screenshot(driver, f"tile2_no_time_stop{i+1}")
+            continue
+
+        log.info("── Stop %d/%d ──", i + 1, btn_count)
+        # After reporting stop 1, the Report button for stop 1 may disappear,
+        # so stop 2's button shifts to index 0. Always use index 0 for the
+        # next unprocessed stop.
+        btn_index = 0 if i > 0 else 0  # always click the first visible Report button
+        success = process_one_stop(driver, stop_index=btn_index,
+                                   planned_time_raw=cached_times[i],
+                                   dry_run=dry_run)
         if success:
-            stops_processed += 1
+            stops_done += 1
 
-    # Navigate back to list
-    try:
-        back_btn = wait_for_element(driver, *BACK_BUTTON, timeout=10, clickable=True)
-        back_btn.click()
-        log.info("Navigated back to Events to Report list")
-    except TimeoutException:
-        driver.back()
-        log.info("Used browser back to return to list")
+        if i < btn_count - 1:
+            _time.sleep(1)
+            wait_for_page_ready(driver)
 
-    return stops_processed
+    log.info("Detail page done: %d/%d stops processed", stops_done, btn_count)
+    return stops_done
 
 
 def run(driver: WebDriver, *, dry_run: bool = False, **_kwargs):
-    """Execute the full Tile 2 workflow.
-
-    Returns total number of stops reported.
-    """
+    """Execute the full Tile 2 workflow."""
     navigate_to_tile(driver)
     go_to_events_tab(driver)
 
-    # Scroll to load all items first
-    scroll_to_load_all(driver)
+    wait_for_page_ready(driver)
+    row_count = get_row_count(driver)
 
-    total_stops = 0
-    order_count = len(driver.find_elements(*REPORT_FINAL_TIME_BTN_ROW))
-
-    if order_count == 0:
+    if row_count == 0:
         log.info("No events to report — done")
+        take_screenshot(driver, "tile2_no_events")
         return 0
 
-    log.info("Found %d freight orders with events to report", order_count)
+    log.info("Found %d rows in Events to Report", row_count)
+    take_screenshot(driver, "tile2_events_list")
 
-    # Process orders one at a time (each opens a detail page and returns)
-    # After going back, the list re-renders, so we always process index 0
-    for i in range(order_count):
-        log.info("Processing order %d/%d", i + 1, order_count)
-        stops = process_order(driver, order_index=0, dry_run=dry_run)
-        total_stops += stops
+    total_stops = 0
 
-        if dry_run and i == 0:
-            # In dry-run, process just the first order to show what would happen
-            log.info("[DRY RUN] Processed 1 order as sample — %d more would follow", order_count - 1)
+    for i in range(row_count):
+        log.info("════ Order %d/%d ════", i + 1, row_count)
+
+        if not click_into_first_row(driver):
+            log.error("Could not click into row — stopping")
             break
 
-    log.info("Tile 2 complete — %d stops %s across %d orders",
-             total_stops, "would be reported (dry run)" if dry_run else "reported", order_count)
+        wait_for_page_ready(driver)
+        stops = process_detail_page(driver, dry_run=dry_run)
+        total_stops += stops
+
+        # ALL stops done for this order — now click Back
+        try:
+            back_btn = wait_for_element(driver, *BACK_BUTTON, timeout=10, clickable=True)
+            back_btn.click()
+            log.info("Clicked Back to return to list")
+            wait_for_page_ready(driver)
+        except TimeoutException:
+            driver.back()
+            log.info("Used browser back")
+            wait_for_page_ready(driver)
+
+        # Reported item stays in list until page refresh — refresh to remove it
+        # Events to Report tab stays active after refresh, no need to re-click it
+        log.info("Refreshing page to clear reported item from list")
+        driver.refresh()
+        wait_for_page_ready(driver)
+
+        remaining = get_row_count(driver)
+        log.info("Remaining rows: %d", remaining)
+
+        if remaining == 0:
+            log.info("All events processed")
+            break
+
+        if dry_run and i == 0:
+            log.info("[DRY RUN] Processed 1 order — %d more would follow", remaining)
+            break
+
+    log.info("Tile 2 complete — %d stops %s",
+             total_stops, "would be reported (dry run)" if dry_run else "reported")
     return total_stops

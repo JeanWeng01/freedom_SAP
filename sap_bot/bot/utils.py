@@ -34,8 +34,45 @@ def take_screenshot(driver: WebDriver, label: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
-# Wait helpers (never use time.sleep)
+# Wait helpers
 # ---------------------------------------------------------------------------
+
+def wait_for_page_ready(driver: WebDriver, timeout: int = 30):
+    """Wait for SAP Fiori page to finish loading.
+
+    Waits for:
+    1. Document ready state
+    2. SAP UI5 busy indicators to disappear
+    3. A short settle time for async rendering
+    """
+    import time as _time
+
+    # Wait for document ready
+    WebDriverWait(driver, timeout).until(
+        lambda d: d.execute_script("return document.readyState") == "complete"
+    )
+
+    # Wait for SAP UI5 busy indicators to disappear
+    try:
+        WebDriverWait(driver, timeout).until(
+            lambda d: len(d.find_elements(
+                By.CSS_SELECTOR,
+                ".sapUiLocalBusyIndicator, .sapMBusyDialog, "
+                ".sapUiBlockLayerTabbable, .sapMBusyIndicator"
+            )) == 0 or all(
+                not el.is_displayed() for el in d.find_elements(
+                    By.CSS_SELECTOR,
+                    ".sapUiLocalBusyIndicator, .sapMBusyDialog, "
+                    ".sapUiBlockLayerTabbable, .sapMBusyIndicator"
+                )
+            )
+        )
+    except TimeoutException:
+        log.debug("Busy indicator wait timed out — proceeding")
+
+    # Short settle time for Fiori async rendering
+    _time.sleep(2)
+
 
 def wait_for_element(driver: WebDriver, by: str, value: str,
                      timeout: int = 30, clickable: bool = False) -> WebElement:
@@ -91,6 +128,78 @@ def scroll_to_load_all(driver: WebDriver, list_container_css: str = None,
 
 
 # ---------------------------------------------------------------------------
+# Tile navigation helper
+# ---------------------------------------------------------------------------
+
+def click_tile(driver: WebDriver, tile_name: str, timeout: int = 30):
+    """Find and click a tile on the SAP Fiori Launchpad home page.
+
+    SAP Fiori inserts soft-hyphen characters (\\xad) into tile text for
+    word-wrapping, so exact text matching is unreliable. Instead, we strip
+    soft hyphens from the page text and use JavaScript to find the match.
+    """
+    log.info("Looking for tile: '%s'", tile_name)
+
+    # Wait for the Fiori Launchpad to fully render
+    wait_for_page_ready(driver, timeout)
+    take_screenshot(driver, f"home_before_tile_{tile_name.replace(' ', '_')[:20]}")
+
+    # Use JavaScript to find spans whose text (stripped of soft hyphens) matches
+    js_find = """
+    var tileName = arguments[0];
+    var spans = document.querySelectorAll('span');
+    for (var i = 0; i < spans.length; i++) {
+        var clean = spans[i].textContent.replace(/\\xAD/g, '').trim();
+        if (clean === tileName) {
+            return spans[i];
+        }
+    }
+    // Fallback: partial match
+    for (var i = 0; i < spans.length; i++) {
+        var clean = spans[i].textContent.replace(/\\xAD/g, '').trim();
+        if (clean.indexOf(tileName) !== -1 && clean.length < tileName.length + 20) {
+            return spans[i];
+        }
+    }
+    return null;
+    """
+
+    # Try with increasing wait
+    element = None
+    for attempt in range(3):
+        element = driver.execute_script(js_find, tile_name)
+        if element:
+            break
+        import time as _time
+        _time.sleep(3)
+
+    if element:
+        try:
+            element.click()
+        except Exception:
+            driver.execute_script("arguments[0].click();", element)
+        log.info("Clicked tile '%s'", tile_name)
+        return True
+
+    # Failed — take debug screenshot and log page text
+    log.error("Could not find tile '%s' on the page", tile_name)
+    take_screenshot(driver, f"tile_not_found_{tile_name.replace(' ', '_')[:20]}")
+
+    try:
+        all_spans = driver.find_elements(By.CSS_SELECTOR, "span")
+        tile_texts = []
+        for s in all_spans:
+            t = s.text.replace('\xad', '').strip()
+            if len(t) > 3 and t not in tile_texts:
+                tile_texts.append(t)
+        log.info("Visible span texts on page: %s", tile_texts[:30])
+    except Exception:
+        pass
+
+    raise TimeoutException(f"Tile '{tile_name}' not found on home page")
+
+
+# ---------------------------------------------------------------------------
 # Dry-run guard
 # ---------------------------------------------------------------------------
 
@@ -105,8 +214,9 @@ def destructive_action(action_description: str):
     The wrapped function MUST accept dry_run and step_through as keyword args.
     """
     def decorator(func):
-        @functools.wraps(func)
-        def wrapper(*args, dry_run=False, step_through=False, **kwargs):
+        def wrapper(*args, **kwargs):
+            dry_run = kwargs.pop("dry_run", False)
+            step_through = kwargs.pop("step_through", False)
             desc = action_description.format(**kwargs) if kwargs else action_description
 
             if dry_run:
@@ -124,7 +234,7 @@ def destructive_action(action_description: str):
                     log.info("[QUIT] User quit at: %s", desc)
                     raise KeyboardInterrupt("User chose to quit at step-through prompt")
 
-            return func(*args, dry_run=False, step_through=False, **kwargs)
+            return func(*args, **kwargs)
         return wrapper
     return decorator
 

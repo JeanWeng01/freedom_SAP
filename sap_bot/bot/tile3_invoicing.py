@@ -12,19 +12,13 @@ from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
 from bot.utils import (
     wait_for_element, wait_for_elements, wait_until_gone,
-    take_screenshot, destructive_action,
+    take_screenshot, destructive_action, click_tile,
 )
 from bot.excel_reader import InvoiceRow
 
 log = logging.getLogger(__name__)
 
-# ── Selectors ───────────────────────────────────────────────────────────────
-TILE_SELECTOR = (By.XPATH,
-    "//div[contains(@class,'sapUshellTile')]//span[contains(text(),'Invoice Freight Documents')]"
-    "/ancestor::div[contains(@class,'sapUshellTile')]"
-    " | //div[contains(@class,'sapUshellTile')]//span[contains(text(),'Freight Documents')]"
-    "/ancestor::div[contains(@class,'sapUshellTile')]"
-)
+TILE_NAME = "Invoice Freight Documents"
 
 # Filter field for Freight Document number
 FREIGHT_DOC_FILTER = (By.CSS_SELECTOR,
@@ -131,9 +125,7 @@ BACK_BUTTON = (By.CSS_SELECTOR,
 
 def navigate_to_tile(driver: WebDriver):
     """Click the Invoice Freight Documents tile."""
-    log.info("Navigating to Invoice Freight Documents tile")
-    tile = wait_for_element(driver, *TILE_SELECTOR, timeout=30, clickable=True)
-    tile.click()
+    click_tile(driver, TILE_NAME)
     wait_for_element(driver, *TO_BE_INVOICED_TAB, timeout=30)
     log.info("Tile 3 page loaded")
 

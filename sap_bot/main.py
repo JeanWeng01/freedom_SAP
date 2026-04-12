@@ -16,9 +16,13 @@ from datetime import datetime
 from pathlib import Path
 
 import yaml
+from dotenv import load_dotenv
 
 # Ensure the sap_bot directory is on the path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# Load .env file for secrets
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 from bot.driver_setup import create_driver
 from bot.login import login
@@ -42,7 +46,7 @@ log = logging.getLogger("sap_bot")
 
 
 def load_config(path: str = None) -> dict:
-    """Load config.yaml and return as dict."""
+    """Load config.yaml and merge in secrets from .env."""
     if path is None:
         path = os.path.join(os.path.dirname(__file__), "config.yaml")
     if not os.path.isfile(path):
@@ -50,7 +54,17 @@ def load_config(path: str = None) -> dict:
         raise SystemExit(f"Config file not found: {path}")
     with open(path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
-    log.info("Config loaded from %s", path)
+
+    # Merge secrets from environment (.env)
+    cfg["login_url"] = os.environ.get("SAP_LOGIN_URL", cfg.get("login_url", ""))
+    cfg["launchpad_url"] = os.environ.get("SAP_LAUNCHPAD_URL", cfg.get("launchpad_url", ""))
+    cfg["username"] = os.environ.get("SAP_USERNAME", cfg.get("username", ""))
+    cfg["password"] = os.environ.get("SAP_PASSWORD", cfg.get("password", ""))
+
+    if not cfg["launchpad_url"] or not cfg["username"] or not cfg["password"]:
+        raise SystemExit("Missing SAP_LAUNCHPAD_URL, SAP_USERNAME, or SAP_PASSWORD in .env file")
+
+    log.info("Config loaded from %s (secrets from .env)", path)
     return cfg
 
 
@@ -146,7 +160,7 @@ def run_tiles(driver, cfg: dict, tiles: list[int]):
 
         # Navigate back to home for next tile
         try:
-            driver.get(cfg["sap_url"])
+            driver.get(cfg["launchpad_url"])
         except Exception:
             pass
 
@@ -218,7 +232,8 @@ def main():
 
     try:
         # Login
-        success = login(driver, cfg["sap_url"], cfg["username"], cfg["password"])
+        success = login(driver, cfg["login_url"], cfg["launchpad_url"],
+                        cfg["username"], cfg["password"])
         if not success:
             log.error("Login failed — aborting")
             print("\n  Login failed. Check logs and screenshots for details.")
@@ -231,6 +246,15 @@ def main():
             run_tiles(driver, cfg, tiles)
 
     finally:
+        if not args.autonomous:
+            print("\n  Bot finished. Browser will close in 10 seconds...")
+            print("  (Press Ctrl+C to keep browser open)")
+            try:
+                import time as _time
+                _time.sleep(10)
+            except KeyboardInterrupt:
+                print("  Keeping browser open. Close it manually when done.")
+                input("  Press Enter to quit...")
         log.info("Closing browser")
         driver.quit()
 
