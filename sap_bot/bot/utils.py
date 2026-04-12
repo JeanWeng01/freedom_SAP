@@ -14,8 +14,10 @@ from selenium.common.exceptions import TimeoutException
 
 log = logging.getLogger(__name__)
 
+HEADLESS = os.environ.get("HEADLESS", "false").lower() == "true"
 SCREENSHOTS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "screenshots")
-os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
+if not HEADLESS:
+    os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -23,7 +25,12 @@ os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
 # ---------------------------------------------------------------------------
 
 def take_screenshot(driver: WebDriver, label: str = "") -> str:
-    """Save a timestamped screenshot and return the file path."""
+    """Save a timestamped screenshot and return the file path.
+
+    Skipped entirely in headless mode (Railway) to save storage.
+    """
+    if HEADLESS:
+        return ""
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_label = label.replace(" ", "_").replace("/", "-")[:60]
     filename = f"{ts}_{safe_label}.png" if safe_label else f"{ts}.png"
@@ -40,38 +47,52 @@ def take_screenshot(driver: WebDriver, label: str = "") -> str:
 def wait_for_page_ready(driver: WebDriver, timeout: int = 30):
     """Wait for SAP Fiori page to finish loading.
 
+    Uses pure JavaScript to avoid stale element references when SAP
+    rebuilds the DOM (e.g. after popup close, page refresh, navigation).
+
     Waits for:
     1. Document ready state
-    2. SAP UI5 busy indicators to disappear
-    3. A short settle time for async rendering
+    2. A minimum settle time (so navigation/popup has time to start)
+    3. SAP UI5 busy indicators + block layers to disappear
     """
     import time as _time
 
-    # Wait for document ready
-    WebDriverWait(driver, timeout).until(
-        lambda d: d.execute_script("return document.readyState") == "complete"
-    )
+    # Minimum wait — give SAP time to START loading (busy indicators may not
+    # appear instantly after a click)
+    _time.sleep(1.5)
 
-    # Wait for SAP UI5 busy indicators to disappear
+    # Wait for document ready
     try:
         WebDriverWait(driver, timeout).until(
-            lambda d: len(d.find_elements(
-                By.CSS_SELECTOR,
-                ".sapUiLocalBusyIndicator, .sapMBusyDialog, "
-                ".sapUiBlockLayerTabbable, .sapMBusyIndicator"
-            )) == 0 or all(
-                not el.is_displayed() for el in d.find_elements(
-                    By.CSS_SELECTOR,
-                    ".sapUiLocalBusyIndicator, .sapMBusyDialog, "
-                    ".sapUiBlockLayerTabbable, .sapMBusyIndicator"
-                )
-            )
+            lambda d: d.execute_script("return document.readyState") == "complete"
         )
-    except TimeoutException:
-        log.debug("Busy indicator wait timed out — proceeding")
+    except Exception:
+        _time.sleep(2)
 
-    # Short settle time for Fiori async rendering
-    _time.sleep(2)
+    # Wait for SAP UI5 busy indicators AND block layers to disappear — pure JS
+    try:
+        WebDriverWait(driver, timeout).until(
+            lambda d: d.execute_script("""
+                var indicators = document.querySelectorAll(
+                    '.sapUiLocalBusyIndicator, .sapMBusyDialog, ' +
+                    '.sapUiBlockLayerTabbable, .sapMBusyIndicator, ' +
+                    '.sapUiBLy'
+                );
+                for (var i = 0; i < indicators.length; i++) {
+                    var el = indicators[i];
+                    // Check if truly visible: has layout AND not hidden
+                    if (el.offsetParent !== null &&
+                        el.style.visibility !== 'hidden' &&
+                        el.style.display !== 'none' &&
+                        el.offsetWidth > 0) {
+                        return false;
+                    }
+                }
+                return true;
+            """)
+        )
+    except Exception:
+        log.debug("Busy indicator wait failed — proceeding")
 
 
 def wait_for_element(driver: WebDriver, by: str, value: str,

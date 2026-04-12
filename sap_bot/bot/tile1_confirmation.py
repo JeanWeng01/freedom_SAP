@@ -50,8 +50,54 @@ CONFIRM_BUTTON = (By.XPATH,
 
 
 def navigate_to_tile(driver: WebDriver):
-    """Click the Freight Orders for Confirmation tile from the home page."""
+    """Click the Freight Orders for Confirmation tile and wait for it to actually load."""
     click_tile(driver, TILE_NAME)
+    from selenium.webdriver.support.ui import WebDriverWait
+    try:
+        WebDriverWait(driver, 30).until(
+            lambda d: d.execute_script("""
+                var inputs = document.querySelectorAll('input[placeholder], input[aria-label]');
+                for (var i = 0; i < inputs.length; i++) {
+                    if (inputs[i].offsetParent === null) continue;
+                    var ph = (inputs[i].placeholder || '').toLowerCase();
+                    var al = (inputs[i].getAttribute('aria-label') || '').toLowerCase();
+                    if (ph.indexOf('freight') !== -1 || al.indexOf('freight') !== -1) return true;
+                }
+                var spans = document.querySelectorAll('span');
+                for (var i = 0; i < spans.length; i++) {
+                    if (spans[i].offsetParent === null) continue;
+                    var t = spans[i].textContent.replace(/\\xAD/g, '').trim();
+                    if (/All Freight Orders \\(\\d/.test(t)) return true;
+                    if (t === 'Freight Order Status') return true;
+                }
+                return false;
+            """)
+        )
+        log.info("Tile 1 page content detected")
+    except TimeoutException:
+        log.warning("Tile 1 page content not detected after 30s — retrying")
+        try:
+            import os
+            launchpad_url = os.environ.get("SAP_LAUNCHPAD_URL", "")
+            if launchpad_url:
+                driver.get(launchpad_url)
+                wait_for_page_ready(driver)
+            click_tile(driver, TILE_NAME)
+            WebDriverWait(driver, 30).until(
+                lambda d: d.execute_script("""
+                    var spans = document.querySelectorAll('span');
+                    for (var i = 0; i < spans.length; i++) {
+                        if (spans[i].offsetParent === null) continue;
+                        var t = spans[i].textContent.replace(/\\xAD/g, '').trim();
+                        if (/All Freight Orders \\(\\d/.test(t)) return true;
+                        if (t === 'Freight Order Status') return true;
+                    }
+                    return false;
+                """)
+            )
+            log.info("Tile 1 loaded on retry")
+        except TimeoutException:
+            log.error("Tile 1 failed to load even after retry")
     wait_for_page_ready(driver)
     take_screenshot(driver, "tile1_page_loaded")
     log.info("Tile 1 page loaded")

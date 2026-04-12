@@ -35,9 +35,97 @@ BACK_BUTTON = (By.CSS_SELECTOR,
 )
 
 
+def dismiss_any_popup(driver: WebDriver) -> bool:
+    """Check for and dismiss any error/info popup dialog on the page.
+
+    SAP shows error popups like "already reported" that block everything.
+    Returns True if a popup was found and dismissed.
+    """
+    result = driver.execute_script("""
+        var dialogs = document.querySelectorAll('[class*="sapMDialog"], [role="dialog"]');
+        for (var i = dialogs.length - 1; i >= 0; i--) {
+            var d = dialogs[i];
+            if (d.offsetParent === null) continue;  // skip hidden
+            // Look for Close/OK/Cancel button
+            var btns = d.querySelectorAll('button');
+            for (var j = 0; j < btns.length; j++) {
+                var t = btns[j].textContent.replace(/\\xAD/g, '').trim();
+                if (t === 'Close' || t === 'OK' || t === 'Cancel') {
+                    // Capture the dialog text before closing
+                    var msgText = d.textContent.substring(0, 200).trim();
+                    btns[j].click();
+                    return msgText;
+                }
+            }
+        }
+        return null;
+    """)
+    if result:
+        log.warning("Dismissed popup: %s", result[:150])
+        _time.sleep(1)
+        return True
+    return False
+
+
 def navigate_to_tile(driver: WebDriver):
-    """Click the Freight Orders for Reporting tile."""
+    """Click the Freight Orders for Reporting tile and wait for it to actually load."""
     click_tile(driver, TILE_NAME)
+    # Wait for tile page content that CANNOT exist on the home page:
+    # - The page title "Freight Orders for Reporting" as a page header (not tile label)
+    # - Filter bar fields like "Freight Order", "Ordering Party"
+    # - The data table with "Freight Orders (N)" count
+    from selenium.webdriver.support.ui import WebDriverWait
+    try:
+        WebDriverWait(driver, 30).until(
+            lambda d: d.execute_script("""
+                // Check for filter bar inputs (only on tile page, not home)
+                var inputs = document.querySelectorAll('input[placeholder], input[aria-label]');
+                for (var i = 0; i < inputs.length; i++) {
+                    if (inputs[i].offsetParent === null) continue;
+                    var ph = (inputs[i].placeholder || '').toLowerCase();
+                    var al = (inputs[i].getAttribute('aria-label') || '').toLowerCase();
+                    if (ph.indexOf('freight') !== -1 || al.indexOf('freight') !== -1 ||
+                        ph.indexOf('order') !== -1 || al.indexOf('order') !== -1) {
+                        return true;
+                    }
+                }
+                // Check for "Freight Orders (N)" count label
+                var spans = document.querySelectorAll('span');
+                for (var i = 0; i < spans.length; i++) {
+                    if (spans[i].offsetParent === null) continue;
+                    var t = spans[i].textContent.replace(/\\xAD/g, '').trim();
+                    if (/Freight Orders \\(\\d/.test(t)) return true;
+                    if (t === 'Events To Report' || t === 'Events to Report') return true;
+                }
+                return false;
+            """)
+        )
+        log.info("Tile 2 page content detected")
+    except TimeoutException:
+        log.warning("Tile page content not detected after 30s — retrying tile click")
+        # Retry: go back to home and click tile again
+        try:
+            import os
+            launchpad_url = os.environ.get("SAP_LAUNCHPAD_URL", "")
+            if launchpad_url:
+                driver.get(launchpad_url)
+                wait_for_page_ready(driver)
+            click_tile(driver, TILE_NAME)
+            WebDriverWait(driver, 30).until(
+                lambda d: d.execute_script("""
+                    var spans = document.querySelectorAll('span');
+                    for (var i = 0; i < spans.length; i++) {
+                        if (spans[i].offsetParent === null) continue;
+                        var t = spans[i].textContent.replace(/\\xAD/g, '').trim();
+                        if (/Freight Orders \\(\\d/.test(t)) return true;
+                        if (t === 'Events To Report' || t === 'Events to Report') return true;
+                    }
+                    return false;
+                """)
+            )
+            log.info("Tile 2 loaded on retry")
+        except TimeoutException:
+            log.error("Tile 2 failed to load even after retry")
     wait_for_page_ready(driver)
     take_screenshot(driver, "tile2_page_loaded")
     log.info("Tile 2 page loaded")
@@ -279,6 +367,8 @@ def click_popup_report(driver: WebDriver):
             log.info("Clicked Report in popup (ActionChains)")
         _time.sleep(2)
         wait_for_page_ready(driver)
+        # Dismiss any error popup that may appear (e.g. "already reported")
+        dismiss_any_popup(driver)
         take_screenshot(driver, "tile2_popup_after_report")
         return True
     else:
@@ -390,12 +480,14 @@ def process_one_stop(driver: WebDriver, stop_index: int, planned_time_raw: str,
 def process_detail_page(driver: WebDriver, *, dry_run: bool = False) -> int:
     """Process all stops on the detail page. Returns number of stops processed."""
     wait_for_page_ready(driver)
+    # Dismiss any error popup that appeared when entering the page
+    dismiss_any_popup(driver)
     take_screenshot(driver, "tile2_detail_page")
 
     data = read_stop_data(driver)
 
     if data['reportBtnCount'] == 0:
-        log.warning("No Report Final Time buttons found on detail page")
+        log.info("No Report Final Time buttons — item may already be reported, skipping")
         return 0
 
     # We need one planned time per Report button
@@ -422,11 +514,9 @@ def process_detail_page(driver: WebDriver, *, dry_run: bool = False) -> int:
             continue
 
         log.info("── Stop %d/%d ──", i + 1, btn_count)
-        # After reporting stop 1, the Report button for stop 1 may disappear,
-        # so stop 2's button shifts to index 0. Always use index 0 for the
-        # next unprocessed stop.
-        btn_index = 0 if i > 0 else 0  # always click the first visible Report button
-        success = process_one_stop(driver, stop_index=btn_index,
+        # Use sequential index — Stop 1's button stays after reporting (just changes state),
+        # so Stop 2's button is still at index 1, not 0
+        success = process_one_stop(driver, stop_index=i,
                                    planned_time_raw=cached_times[i],
                                    dry_run=dry_run)
         if success:
@@ -440,63 +530,130 @@ def process_detail_page(driver: WebDriver, *, dry_run: bool = False) -> int:
     return stops_done
 
 
-def run(driver: WebDriver, *, dry_run: bool = False, **_kwargs):
-    """Execute the full Tile 2 workflow."""
-    navigate_to_tile(driver)
-    go_to_events_tab(driver)
-
+def go_back_to_home(driver: WebDriver, launchpad_url: str = None):
+    """Navigate back to the SAP Fiori home page."""
+    if launchpad_url:
+        driver.get(launchpad_url)
+    else:
+        # Click back until we reach home
+        for _ in range(5):
+            try:
+                back_btn = driver.find_element(*BACK_BUTTON)
+                back_btn.click()
+                wait_for_page_ready(driver)
+            except Exception:
+                break
     wait_for_page_ready(driver)
-    row_count = get_row_count(driver)
+    log.info("Returned to home page")
 
-    if row_count == 0:
-        log.info("No events to report — done")
-        take_screenshot(driver, "tile2_no_events")
-        return 0
 
-    log.info("Found %d rows in Events to Report", row_count)
-    take_screenshot(driver, "tile2_events_list")
+def click_back(driver: WebDriver):
+    """Click Back button with fallbacks."""
+    wait_for_page_ready(driver)
+    dismiss_any_popup(driver)
 
-    total_stops = 0
-
-    for i in range(row_count):
-        log.info("════ Order %d/%d ════", i + 1, row_count)
-
-        if not click_into_first_row(driver):
-            log.error("Could not click into row — stopping")
-            break
-
+    try:
+        back_btn = wait_for_element(driver, *BACK_BUTTON, timeout=10, clickable=True)
+        back_btn.click()
+        log.info("Clicked Back")
         wait_for_page_ready(driver)
-        stops = process_detail_page(driver, dry_run=dry_run)
-        total_stops += stops
-
-        # ALL stops done for this order — now click Back
+    except Exception as e:
+        log.warning("Back button click failed: %s — trying JS", e)
         try:
-            back_btn = wait_for_element(driver, *BACK_BUTTON, timeout=10, clickable=True)
-            back_btn.click()
-            log.info("Clicked Back to return to list")
+            driver.execute_script("""
+                var btn = document.querySelector('a#backBtn, button[title="Back"], .sapMNavBack');
+                if (btn) btn.click();
+            """)
+            log.info("Clicked Back via JS")
             wait_for_page_ready(driver)
-        except TimeoutException:
+        except Exception:
             driver.back()
             log.info("Used browser back")
             wait_for_page_ready(driver)
 
-        # Reported item stays in list until page refresh — refresh to remove it
-        # Events to Report tab stays active after refresh, no need to re-click it
-        log.info("Refreshing page to clear reported item from list")
-        driver.refresh()
-        wait_for_page_ready(driver)
 
-        remaining = get_row_count(driver)
-        log.info("Remaining rows: %d", remaining)
+def process_batch(driver: WebDriver, *, dry_run: bool = False) -> int:
+    """Process the currently loaded batch of items in Events to Report.
 
-        if remaining == 0:
-            log.info("All events processed")
+    Returns number of stops reported in this batch.
+    """
+    row_count = get_row_count(driver)
+    if row_count == 0:
+        return 0
+
+    log.info("Batch: %d rows loaded", row_count)
+    batch_stops = 0
+
+    for i in range(row_count):
+        log.info("── Item %d/%d ──", i + 1, row_count)
+
+        if not click_into_first_row(driver):
+            log.error("Could not click into row — stopping batch")
             break
+
+        wait_for_page_ready(driver)
+        stops = process_detail_page(driver, dry_run=dry_run)
+        batch_stops += stops
+
+        # Go back to Events to Report list
+        click_back(driver)
+
+        # Refresh to remove the reported item from the list
+        log.info("Refreshing page to clear reported item")
+        driver.refresh()
+        _time.sleep(3)
+        try:
+            wait_for_page_ready(driver)
+        except Exception:
+            _time.sleep(3)
 
         if dry_run and i == 0:
-            log.info("[DRY RUN] Processed 1 order — %d more would follow", remaining)
+            log.info("[DRY RUN] Processed 1 item — stopping batch")
             break
 
-    log.info("Tile 2 complete — %d stops %s",
+    return batch_stops
+
+
+def run(driver: WebDriver, *, dry_run: bool = False, **_kwargs):
+    """Execute the full Tile 2 workflow.
+
+    Outer loop: SAP only loads ~20 items at a time in Events to Report.
+    After processing a batch, go back to home, re-enter tile 2 to get
+    the next batch. Repeat until 0 events remain.
+    """
+    import os
+    launchpad_url = os.environ.get("SAP_LAUNCHPAD_URL", "")
+
+    total_stops = 0
+    max_batches = 50  # safety limit
+
+    for batch_num in range(1, max_batches + 1):
+        log.info("══════════ Batch %d ══════════", batch_num)
+
+        navigate_to_tile(driver)
+        go_to_events_tab(driver)
+        wait_for_page_ready(driver)
+
+        row_count = get_row_count(driver)
+        log.info("Events to Report: %d rows loaded", row_count)
+        take_screenshot(driver, f"tile2_batch{batch_num}_events")
+
+        if row_count == 0:
+            log.info("No more events to report — all done!")
+            break
+
+        batch_stops = process_batch(driver, dry_run=dry_run)
+        total_stops += batch_stops
+        log.info("Batch %d done: %d stops reported", batch_num, batch_stops)
+
+        if dry_run:
+            log.info("[DRY RUN] Stopping after first batch")
+            break
+
+        # Go back to home page, then re-enter tile 2 for the next batch
+        log.info("Returning to home page for next batch")
+        go_back_to_home(driver, launchpad_url)
+
+    log.info("Tile 2 complete — %d total stops %s",
              total_stops, "would be reported (dry run)" if dry_run else "reported")
     return total_stops
