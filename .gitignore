@@ -1,0 +1,29 @@
+# Secrets
+.env
+sap_bot/.env
+service_account.json
+sap_bot/service_account.json
+
+# Screenshots (debug artifacts)
+sap_bot/screenshots/
+
+# Logs
+sap_bot/logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# IDE / tools
+.vscode/
+.idea/
+.claude/
+
+# Data files (user-managed, not in repo)
+SAP_bot.xlsx
+
+# Reference screenshots (not needed in deployment)
+*.png

@@ -1,0 +1,31 @@
+FROM python:3.13-slim
+
+# Install Chrome + dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    wget \
+    gnupg2 \
+    unzip \
+    curl \
+    && wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg \
+    && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends google-chrome-stable \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy and install Python deps
+COPY sap_bot/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy bot code
+COPY sap_bot/ .
+
+# Railway sets PORT env var
+ENV HEADLESS=true
+ENV PYTHONUNBUFFERED=1
+
+EXPOSE 8080
+
+CMD ["python", "server.py"]
