@@ -650,6 +650,10 @@ def run(driver: WebDriver, *, dry_run: bool = False, **_kwargs):
             log.info("[DRY RUN] Stopping after first batch")
             break
 
+        if batch_stops == 0:
+            log.info("Batch produced 0 reported stops — no more actionable items, done")
+            break
+
         # Go back to home page, then re-enter tile 2 for the next batch
         log.info("Returning to home page for next batch")
         go_back_to_home(driver, launchpad_url)

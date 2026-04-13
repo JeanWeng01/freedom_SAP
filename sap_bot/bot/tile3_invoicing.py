@@ -1,278 +1,412 @@
 """Tile 3 — Invoice Freight Documents.
 
-Goal: For each row in SAP_bot.xlsx, filter for freight document(s), create invoice,
-enter invoice number, add charges if applicable, and submit. Human-gated.
+Goal: For each row in Google Sheet "To Do" tab, filter for freight document(s),
+create invoice, enter invoice number, add charges if applicable, and submit.
+
+Human-gated: runs on Railway 4am-9am, or manually triggered.
 """
 
 import logging
+import time as _time
 from selenium.webdriver.remote.webdriver import WebDriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.common.action_chains import ActionChains
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
 from bot.utils import (
-    wait_for_element, wait_for_elements, wait_until_gone,
-    take_screenshot, destructive_action, click_tile,
+    wait_for_element, wait_for_page_ready, take_screenshot,
+    destructive_action, click_tile,
 )
-from bot.excel_reader import InvoiceRow
+from bot.google_sheets import InvoiceRow, read_todo_items, move_to_status, mark_error
 
 log = logging.getLogger(__name__)
 
 TILE_NAME = "Invoice Freight Documents"
 
-# Filter field for Freight Document number
-FREIGHT_DOC_FILTER = (By.CSS_SELECTOR,
-    "input[placeholder*='Freight Document'], input[id*='FreightDocument'],"
-    " input[aria-label*='Freight Document']"
-)
-
-# Expand icon on the filter (for multi-value / collective invoice)
-FILTER_EXPAND_ICON = (By.CSS_SELECTOR,
-    "button[id*='FreightDocument'][id*='vhi'], .sapMSFB .sapUiIcon"
-)
-
-# Popup for multi-value filter (Value Help dialog)
-VALUE_HELP_DIALOG = (By.CSS_SELECTOR,
-    ".sapMDialog[id*='ValueHelp'], .sapMDialog"
-)
-VALUE_HELP_INPUT_1 = (By.XPATH,
-    "(//div[contains(@class,'sapMDialog')]//input[contains(@class,'sapMInputBaseInner')])[1]"
-)
-VALUE_HELP_INPUT_2 = (By.XPATH,
-    "(//div[contains(@class,'sapMDialog')]//input[contains(@class,'sapMInputBaseInner')])[2]"
-)
-ADD_CONDITION_BUTTON = (By.XPATH,
-    "//div[contains(@class,'sapMDialog')]//button[.//bdi[contains(text(),'Add')]]"
-)
-CONDITION_DROPDOWN = (By.XPATH,
-    "//div[contains(@class,'sapMDialog')]//select | //div[contains(@class,'sapMDialog')]//div[contains(@class,'sapMSlt')]"
-)
-VALUE_HELP_OK = (By.XPATH,
-    "//div[contains(@class,'sapMDialog')]//button[.//bdi[text()='OK'] or .//bdi[text()='Go']]"
-)
-
-# To Be Invoiced tab
-TO_BE_INVOICED_TAB = (By.XPATH,
-    "//*[contains(text(),'To be Invoiced')]/.."
-)
-
-# Table rows (freight documents listed after filtering)
-DOC_ROWS = (By.CSS_SELECTOR,
-    "table tbody tr, .sapMListItems .sapMLIB"
-)
-ROW_CHECKBOX = (By.CSS_SELECTOR,
-    ".sapMCb, input[type='checkbox']"
-)
-
-# Create Invoice / Create Collective Invoice buttons
-CREATE_INVOICE_BTN = (By.XPATH,
-    "//button[.//bdi[text()='Create Invoice']]"
-)
-CREATE_COLLECTIVE_INVOICE_BTN = (By.XPATH,
-    "//button[.//bdi[text()='Create Collective Invoice']]"
-)
-
-# Invoice Details tab on the invoice page
-INVOICE_DETAILS_TAB = (By.XPATH,
-    "//*[contains(text(),'Invoice Details')]/.."
-)
-
-# Invoice number input field
-INVOICE_INPUT = (By.CSS_SELECTOR,
-    "input[id*='Invoice'], input[aria-label*='Invoice'],"
-    " input[id*='invoice']"
-)
-
-# Charges tab
-CHARGES_TAB = (By.XPATH,
-    "//*[contains(text(),'Charges')]/.."
-)
-
-# Add button in charges section
-CHARGES_ADD_BTN = (By.XPATH,
-    "//button[.//bdi[text()='Add']]"
-)
-
-# Charge type dropdown option
-CHARGE_OPTION = (By.XPATH,
-    "//li[contains(text(),'Charge')] | //div[contains(@class,'sapMSLI')]//span[text()='Charge']/.."
-)
-
-# Waiting Charges selection in popup
-WAITING_CHARGES_OPTION = (By.XPATH,
-    "//*[contains(text(),'Waiting Charges')]"
-)
-
-# Rate Amount input (in the newly added charge row)
-RATE_AMOUNT_INPUT = (By.CSS_SELECTOR,
-    "input[id*='Rate'], input[id*='rate'], input[id*='Amount'], input[id*='amount']"
-)
-
-# Submit button
-SUBMIT_BUTTON = (By.XPATH,
-    "//button[.//bdi[text()='Submit']]"
-)
-
-# Drafts indicator — if we land on drafts instead of invoice page
-DRAFTS_INDICATOR = (By.XPATH,
-    "//*[contains(text(),'Draft')] | //*[contains(text(),'draft')]"
-)
-
 BACK_BUTTON = (By.CSS_SELECTOR,
-    ".sapMNavBack, button[title='Back'], .sapUshellShellHeadItm[title='Back']"
+    "button[title='Back'], .sapMNavBack, .sapUshellShellHeadItm[title='Back']"
 )
 
 
 def navigate_to_tile(driver: WebDriver):
-    """Click the Invoice Freight Documents tile."""
+    """Click the Invoice Freight Documents tile and wait for it to load."""
     click_tile(driver, TILE_NAME)
-    wait_for_element(driver, *TO_BE_INVOICED_TAB, timeout=30)
+    from selenium.webdriver.support.ui import WebDriverWait
+    try:
+        WebDriverWait(driver, 30).until(
+            lambda d: d.execute_script("""
+                var spans = document.querySelectorAll('span');
+                for (var i = 0; i < spans.length; i++) {
+                    if (spans[i].offsetParent === null) continue;
+                    var t = spans[i].textContent.replace(/\\xAD/g, '').trim();
+                    if (/Freight Documents \\(/.test(t)) return true;
+                    if (t === 'To be Invoiced' || t === 'To Be Invoiced') return true;
+                }
+                return false;
+            """)
+        )
+    except TimeoutException:
+        log.warning("Tile 3 page content not detected after 30s — retrying")
+        import os
+        launchpad_url = os.environ.get("SAP_LAUNCHPAD_URL", "")
+        if launchpad_url:
+            driver.get(launchpad_url)
+            wait_for_page_ready(driver)
+        click_tile(driver, TILE_NAME)
+        _time.sleep(10)
+    wait_for_page_ready(driver)
+    take_screenshot(driver, "tile3_page_loaded")
     log.info("Tile 3 page loaded")
 
 
+def dismiss_any_popup(driver: WebDriver) -> bool:
+    """Dismiss any error/info popup on the page."""
+    result = driver.execute_script("""
+        var dialogs = document.querySelectorAll('[class*="sapMDialog"], [role="dialog"]');
+        for (var i = dialogs.length - 1; i >= 0; i--) {
+            var d = dialogs[i];
+            if (d.offsetParent === null) continue;
+            var btns = d.querySelectorAll('button');
+            for (var j = 0; j < btns.length; j++) {
+                var t = btns[j].textContent.replace(/\\xAD/g, '').trim();
+                if (t === 'Close' || t === 'OK' || t === 'Cancel') {
+                    var msgText = d.textContent.substring(0, 200).trim();
+                    btns[j].click();
+                    return msgText;
+                }
+            }
+        }
+        return null;
+    """)
+    if result:
+        log.warning("Dismissed popup: %s", result[:150])
+        _time.sleep(1)
+        return True
+    return False
+
+
 def filter_single_document(driver: WebDriver, doc_number: str):
-    """Filter by a single freight document number."""
-    filter_input = wait_for_element(driver, *FREIGHT_DOC_FILTER, timeout=15)
-    filter_input.clear()
-    filter_input.send_keys(doc_number)
-    filter_input.send_keys(Keys.RETURN)
-    log.info("Filtered for document: %s", doc_number)
-    # Wait for results to load
-    try:
-        wait_for_elements(driver, *DOC_ROWS, timeout=15)
-    except TimeoutException:
-        log.warning("No results after filtering for %s", doc_number)
+    """Filter by a single freight document number using the filter input."""
+    input_el = driver.execute_script("""
+        var labels = document.querySelectorAll('label, span');
+        for (var i = 0; i < labels.length; i++) {
+            var clean = labels[i].textContent.replace(/\\xAD/g, '').trim();
+            if (clean.indexOf('Freight Document') !== -1) {
+                var parent = labels[i].parentElement;
+                for (var j = 0; j < 5 && parent; j++) {
+                    var input = parent.querySelector('input:not([type="hidden"])');
+                    if (input) return input;
+                    parent = parent.parentElement;
+                }
+            }
+        }
+        // Fallback: find any input with freight document in placeholder/label
+        var inputs = document.querySelectorAll('input');
+        for (var i = 0; i < inputs.length; i++) {
+            var ph = (inputs[i].placeholder || '').toLowerCase();
+            var al = (inputs[i].getAttribute('aria-label') || '').toLowerCase();
+            if (ph.indexOf('freight doc') !== -1 || al.indexOf('freight doc') !== -1) return inputs[i];
+        }
+        return null;
+    """)
+    if input_el:
+        input_el.click()
+        _time.sleep(0.3)
+        input_el.clear()
+        input_el.send_keys(doc_number)
+        input_el.send_keys(Keys.RETURN)
+        log.info("Filtered for document: %s", doc_number)
+        wait_for_page_ready(driver)
+    else:
+        log.error("Freight Document filter input not found")
+        take_screenshot(driver, "tile3_filter_missing")
 
 
 def filter_collective_documents(driver: WebDriver, doc1: str, doc2: str):
-    """Filter for two freight documents using the expand/multi-value popup."""
-    # Click the expand icon on the filter
-    try:
-        expand = wait_for_element(driver, *FILTER_EXPAND_ICON, timeout=10, clickable=True)
-        expand.click()
-        log.info("Opened filter value help dialog")
-    except TimeoutException:
-        log.error("Could not open filter expand popup")
-        take_screenshot(driver, "filter_expand_failed")
+    """Filter for two freight documents by entering both in the filter field."""
+    input_el = driver.execute_script("""
+        var labels = document.querySelectorAll('label, span');
+        for (var i = 0; i < labels.length; i++) {
+            var clean = labels[i].textContent.replace(/\\xAD/g, '').trim();
+            if (clean.indexOf('Freight Document') !== -1) {
+                var parent = labels[i].parentElement;
+                for (var j = 0; j < 5 && parent; j++) {
+                    var input = parent.querySelector('input:not([type="hidden"])');
+                    if (input) return input;
+                    parent = parent.parentElement;
+                }
+            }
+        }
+        var inputs = document.querySelectorAll('input');
+        for (var i = 0; i < inputs.length; i++) {
+            var ph = (inputs[i].placeholder || '').toLowerCase();
+            var al = (inputs[i].getAttribute('aria-label') || '').toLowerCase();
+            if (ph.indexOf('freight doc') !== -1 || al.indexOf('freight doc') !== -1) return inputs[i];
+        }
+        return null;
+    """)
+    if not input_el:
+        log.error("Freight Document filter input not found")
+        take_screenshot(driver, "tile3_filter_missing")
         return
 
-    # Wait for the dialog
-    wait_for_element(driver, *VALUE_HELP_DIALOG, timeout=10)
+    # Enter first doc, press Enter, then second doc, press Enter
+    input_el.click()
+    _time.sleep(0.3)
+    input_el.clear()
+    input_el.send_keys(doc1)
+    input_el.send_keys(Keys.RETURN)
+    _time.sleep(1)
+    input_el.send_keys(doc2)
+    input_el.send_keys(Keys.RETURN)
+    log.info("Filtered for documents: %s + %s", doc1, doc2)
+    wait_for_page_ready(driver)
 
-    # Set first condition: "contains" + doc1
+
+def select_all_visible_rows(driver: WebDriver):
+    """Select all visible document rows by clicking each checkbox."""
+    driver.execute_script("""
+        var rows = document.querySelectorAll('.sapMListItems .sapMLIB, .sapMListTblRow');
+        for (var i = 0; i < rows.length; i++) {
+            if (rows[i].offsetParent === null) continue;
+            var cb = rows[i].querySelector('.sapMCb');
+            if (cb && !cb.classList.contains('sapMCbMarkChecked')) cb.click();
+        }
+    """)
+    log.info("Selected all visible rows")
+    _time.sleep(0.5)
+
+
+def click_create_invoice(driver: WebDriver, collective: bool) -> bool:
+    """Click Create Invoice or Create Collective Invoice button. Returns True if invoice page opened."""
+    button_text = "Create Collective Invoice" if collective else "Create Invoice"
+    btn = driver.execute_script("""
+        var target = arguments[0];
+        var btns = document.querySelectorAll('button');
+        for (var i = 0; i < btns.length; i++) {
+            if (btns[i].offsetParent === null) continue;
+            var t = btns[i].textContent.replace(/\\xAD/g, '').trim();
+            if (t === target) return btns[i];
+        }
+        return null;
+    """, button_text)
+
+    if not btn:
+        log.error("'%s' button not found", button_text)
+        take_screenshot(driver, f"tile3_no_{button_text.replace(' ', '_')}_btn")
+        return False
+
     try:
-        input1 = wait_for_element(driver, *VALUE_HELP_INPUT_1, timeout=10)
-        input1.clear()
-        input1.send_keys(doc1)
-        log.info("Entered first document: %s", doc1)
-    except TimeoutException:
-        log.error("First input not found in value help dialog")
-        take_screenshot(driver, "value_help_input1_missing")
-        return
-
-    # Click "Add Condition"
-    try:
-        add_btn = wait_for_element(driver, *ADD_CONDITION_BUTTON, timeout=10, clickable=True)
-        add_btn.click()
-        log.info("Clicked Add Condition")
-    except TimeoutException:
-        log.error("Add Condition button not found")
-        take_screenshot(driver, "add_condition_missing")
-
-    # Set second condition: "contains" + doc2
-    try:
-        input2 = wait_for_element(driver, *VALUE_HELP_INPUT_2, timeout=10)
-        input2.clear()
-        input2.send_keys(doc2)
-        log.info("Entered second document: %s", doc2)
-    except TimeoutException:
-        log.error("Second input not found")
-        take_screenshot(driver, "value_help_input2_missing")
-
-    # Click OK
-    try:
-        ok_btn = wait_for_element(driver, *VALUE_HELP_OK, timeout=10, clickable=True)
-        ok_btn.click()
-        log.info("Confirmed filter dialog")
-    except TimeoutException:
-        log.error("OK button not found in filter dialog")
-        take_screenshot(driver, "value_help_ok_missing")
-
-    # Wait for results
-    try:
-        wait_for_elements(driver, *DOC_ROWS, timeout=15)
-    except TimeoutException:
-        log.warning("No results after collective filter for %s + %s", doc1, doc2)
+        btn.click()
+    except Exception:
+        ActionChains(driver).move_to_element(btn).click().perform()
+    log.info("Clicked '%s'", button_text)
+    wait_for_page_ready(driver)
+    take_screenshot(driver, "tile3_after_create_invoice")
+    return True
 
 
-def select_all_rows(driver: WebDriver):
-    """Select all visible document rows."""
-    rows = driver.find_elements(*DOC_ROWS)
-    for row in rows:
-        try:
-            cb = row.find_element(*ROW_CHECKBOX)
-            if not cb.is_selected():
-                cb.click()
-        except NoSuchElementException:
-            pass
-    log.info("Selected %d document rows", len(rows))
+def enter_invoice_number(driver: WebDriver, invoice_num: str):
+    """Go to Invoice Details tab and enter the invoice number."""
+    # Click Invoice Details tab
+    driver.execute_script("""
+        var spans = document.querySelectorAll('span');
+        for (var i = 0; i < spans.length; i++) {
+            if (spans[i].offsetParent === null) continue;
+            var t = spans[i].textContent.replace(/\\xAD/g, '').trim();
+            if (t === 'Invoice Details') {
+                var tab = spans[i].closest('[role="tab"], [class*="sapMITBFilter"], [class*="sapMITBItem"]');
+                if (tab) { tab.click(); return; }
+                spans[i].click();
+                return;
+            }
+        }
+    """)
+    _time.sleep(1)
+    wait_for_page_ready(driver)
+
+    # Find the Invoice input field
+    inv_input = driver.execute_script("""
+        var labels = document.querySelectorAll('label, span');
+        for (var i = 0; i < labels.length; i++) {
+            var clean = labels[i].textContent.replace(/\\xAD/g, '').trim();
+            if (clean === 'Invoice:' || clean === 'Invoice') {
+                var parent = labels[i].parentElement;
+                for (var j = 0; j < 5 && parent; j++) {
+                    var input = parent.querySelector('input:not([type="hidden"])');
+                    if (input && input.offsetParent !== null) return input;
+                    parent = parent.parentElement;
+                }
+            }
+        }
+        return null;
+    """)
+
+    if inv_input:
+        inv_input.click()
+        _time.sleep(0.3)
+        inv_input.clear()
+        inv_input.send_keys(invoice_num)
+        log.info("Entered invoice number: %s", invoice_num)
+    else:
+        log.error("Invoice input field not found")
+        take_screenshot(driver, "tile3_invoice_input_missing")
 
 
 def add_charge(driver: WebDriver, charge_type: str, amount: float):
-    """Add a charge row in the Charges tab."""
-    # Click Add
-    add_btn = wait_for_element(driver, *CHARGES_ADD_BTN, timeout=10, clickable=True)
-    add_btn.click()
-    log.info("Clicked Add charge")
+    """Add a charge in the Charges tab."""
+    # Click Charges tab
+    driver.execute_script("""
+        var spans = document.querySelectorAll('span');
+        for (var i = 0; i < spans.length; i++) {
+            if (spans[i].offsetParent === null) continue;
+            var t = spans[i].textContent.replace(/\\xAD/g, '').trim();
+            if (t === 'Charges') {
+                var tab = spans[i].closest('[role="tab"], [class*="sapMITBFilter"], [class*="sapMITBItem"]');
+                if (tab) { tab.click(); return; }
+                spans[i].click();
+                return;
+            }
+        }
+    """)
+    _time.sleep(1)
+    wait_for_page_ready(driver)
 
-    # Select "Charge" from dropdown
-    try:
-        charge_opt = wait_for_element(driver, *CHARGE_OPTION, timeout=10, clickable=True)
-        charge_opt.click()
-        log.info("Selected 'Charge' option")
-    except TimeoutException:
-        log.warning("Charge option dropdown not found — may have auto-selected")
-
-    # Click the category cell and select Waiting Charges
-    try:
-        wc_option = wait_for_element(driver, *WAITING_CHARGES_OPTION, timeout=10, clickable=True)
-        wc_option.click()
-        log.info("Selected '%s'", charge_type)
-    except TimeoutException:
-        log.error("Could not find '%s' in charge category list", charge_type)
-        take_screenshot(driver, f"charge_category_missing_{charge_type}")
+    # Click Add button
+    add_btn = driver.execute_script("""
+        var btns = document.querySelectorAll('button');
+        for (var i = 0; i < btns.length; i++) {
+            if (btns[i].offsetParent === null) continue;
+            var t = btns[i].textContent.replace(/\\xAD/g, '').trim();
+            if (t === 'Add') return btns[i];
+        }
+        return null;
+    """)
+    if add_btn:
+        try:
+            add_btn.click()
+        except Exception:
+            ActionChains(driver).move_to_element(add_btn).click().perform()
+        log.info("Clicked Add charge")
+        _time.sleep(1)
+        wait_for_page_ready(driver)
+    else:
+        log.error("Add button not found in Charges tab")
+        take_screenshot(driver, "tile3_add_charge_missing")
         return
 
-    # Enter rate amount
-    try:
-        # Find the last (most recently added) rate input
-        rate_inputs = driver.find_elements(*RATE_AMOUNT_INPUT)
-        rate_input = rate_inputs[-1] if rate_inputs else None
-        if rate_input:
-            rate_input.clear()
-            rate_input.send_keys(str(amount))
-            log.info("Entered charge amount: %s", amount)
-        else:
-            log.error("Rate amount input not found")
-            take_screenshot(driver, "rate_amount_missing")
-    except Exception as e:
-        log.error("Error entering charge amount: %s", e)
-        take_screenshot(driver, "rate_amount_error")
+    # Select "Charge" from dropdown if prompted
+    driver.execute_script("""
+        var items = document.querySelectorAll('li, [class*="sapMSLI"], [role="option"]');
+        for (var i = 0; i < items.length; i++) {
+            if (items[i].offsetParent === null) continue;
+            var t = items[i].textContent.replace(/\\xAD/g, '').trim();
+            if (t === 'Charge') { items[i].click(); return; }
+        }
+    """)
+    _time.sleep(1)
+    wait_for_page_ready(driver)
+
+    # Select charge category (e.g. "Waiting Charges")
+    driver.execute_script("""
+        var items = document.querySelectorAll('li, [class*="sapMSLI"], [role="option"], span');
+        for (var i = 0; i < items.length; i++) {
+            if (items[i].offsetParent === null) continue;
+            var t = items[i].textContent.replace(/\\xAD/g, '').trim();
+            if (t === arguments[0]) { items[i].click(); return; }
+        }
+    """, charge_type)
+    _time.sleep(1)
+    wait_for_page_ready(driver)
+
+    # Enter amount in the rate/amount field — find the last visible input with numeric type
+    driver.execute_script("""
+        var inputs = document.querySelectorAll('input[type="text"], input:not([type="hidden"])');
+        var rateInput = null;
+        for (var i = 0; i < inputs.length; i++) {
+            if (inputs[i].offsetParent === null) continue;
+            var al = (inputs[i].getAttribute('aria-label') || '').toLowerCase();
+            var ph = (inputs[i].placeholder || '').toLowerCase();
+            if (al.indexOf('rate') !== -1 || al.indexOf('amount') !== -1 ||
+                ph.indexOf('rate') !== -1 || ph.indexOf('amount') !== -1) {
+                rateInput = inputs[i];
+            }
+        }
+        if (rateInput) {
+            rateInput.focus();
+            rateInput.value = '';
+            rateInput.dispatchEvent(new Event('input', {bubbles: true}));
+        }
+        return rateInput;
+    """)
+    # Use Selenium to type the amount (JS value setting may not trigger SAP bindings)
+    rate_inputs = driver.find_elements(By.CSS_SELECTOR, "input")
+    for inp in reversed(rate_inputs):
+        try:
+            al = inp.get_attribute("aria-label") or ""
+            if "rate" in al.lower() or "amount" in al.lower():
+                inp.clear()
+                inp.send_keys(str(amount))
+                log.info("Entered charge amount: %s", amount)
+                break
+        except Exception:
+            continue
+    _time.sleep(0.5)
+    take_screenshot(driver, f"tile3_charge_added_{charge_type[:15]}")
 
 
-@destructive_action("Submit invoice {invoice_num} for document(s) {doc_desc}")
-def click_submit(driver: WebDriver, *, invoice_num: str = "", doc_desc: str = ""):
-    """Click the Submit button on the invoice page."""
+@destructive_action("Submit invoice {invoice_num}")
+def click_submit(driver: WebDriver, *, invoice_num: str = ""):
+    """Click the Submit button."""
     take_screenshot(driver, f"tile3_before_submit_{invoice_num}")
-    btn = wait_for_element(driver, *SUBMIT_BUTTON, timeout=15, clickable=True)
-    btn.click()
-    log.info("Clicked Submit for invoice %s", invoice_num)
-    take_screenshot(driver, f"tile3_after_submit_{invoice_num}")
+    btn = driver.execute_script("""
+        var btns = document.querySelectorAll('button');
+        for (var i = 0; i < btns.length; i++) {
+            if (btns[i].offsetParent === null) continue;
+            var t = btns[i].textContent.replace(/\\xAD/g, '').trim();
+            if (t === 'Submit') return btns[i];
+        }
+        return null;
+    """)
+    if btn:
+        try:
+            btn.click()
+        except Exception:
+            ActionChains(driver).move_to_element(btn).click().perform()
+        log.info("Clicked Submit for invoice %s", invoice_num)
+        _time.sleep(2)
+        wait_for_page_ready(driver)
+        dismiss_any_popup(driver)
+        take_screenshot(driver, f"tile3_after_submit_{invoice_num}")
+    else:
+        log.error("Submit button not found")
+        take_screenshot(driver, "tile3_submit_missing")
+
+
+def click_back(driver: WebDriver):
+    """Navigate back with fallbacks."""
+    wait_for_page_ready(driver)
+    dismiss_any_popup(driver)
+    try:
+        back_btn = wait_for_element(driver, *BACK_BUTTON, timeout=10, clickable=True)
+        back_btn.click()
+        wait_for_page_ready(driver)
+    except Exception:
+        try:
+            driver.execute_script("""
+                var btn = document.querySelector('a#backBtn, button[title="Back"], .sapMNavBack');
+                if (btn) btn.click();
+            """)
+            wait_for_page_ready(driver)
+        except Exception:
+            driver.back()
+            wait_for_page_ready(driver)
 
 
 def process_row(driver: WebDriver, row: InvoiceRow,
                 *, dry_run: bool = False, step_through: bool = False) -> str:
-    """Process one Excel row. Returns 'submitted', 'drafted', 'skipped', or 'error'."""
+    """Process one row from Google Sheet. Returns 'submitted', 'drafted', 'skipped', or error message."""
     doc_desc = row.document_1
     if row.is_collective:
         doc_desc = f"{row.document_1} + {row.document_2}"
@@ -286,105 +420,101 @@ def process_row(driver: WebDriver, row: InvoiceRow,
         else:
             filter_single_document(driver, row.document_1)
 
+        take_screenshot(driver, f"tile3_filtered_{row.document_1}")
+
         # Select rows
-        select_all_rows(driver)
+        select_all_visible_rows(driver)
 
-        # Click Create Invoice or Create Collective Invoice
-        if row.is_collective:
-            btn = wait_for_element(driver, *CREATE_COLLECTIVE_INVOICE_BTN, timeout=10, clickable=True)
-            btn.click()
-            log.info("Clicked Create Collective Invoice")
-        else:
-            btn = wait_for_element(driver, *CREATE_INVOICE_BTN, timeout=10, clickable=True)
-            btn.click()
-            log.info("Clicked Create Invoice")
+        # Create invoice
+        if not click_create_invoice(driver, collective=row.is_collective):
+            return "error: Create Invoice button not found"
 
-        # Check if we landed on invoice page or drafts
-        try:
-            wait_for_element(driver, *INVOICE_DETAILS_TAB, timeout=15)
-        except TimeoutException:
-            # Might have gone to drafts
-            log.warning("Invoice page did not open for %s — possibly went to Drafts", doc_desc)
+        # Check if invoice page opened (look for Invoice Details tab)
+        on_invoice = driver.execute_script("""
+            var spans = document.querySelectorAll('span');
+            for (var i = 0; i < spans.length; i++) {
+                if (spans[i].offsetParent === null) continue;
+                var t = spans[i].textContent.replace(/\\xAD/g, '').trim();
+                if (t === 'Invoice Details') return true;
+            }
+            return false;
+        """)
+
+        if not on_invoice:
+            log.warning("Invoice page did not open for %s — may have gone to Drafts", doc_desc)
             take_screenshot(driver, f"tile3_draft_{row.document_1}")
-            # Navigate back
-            try:
-                driver.find_element(*BACK_BUTTON).click()
-            except NoSuchElementException:
-                driver.back()
-            return "drafted"
+            click_back(driver)
+            return "error: went to Drafts instead of invoice page"
 
-        # Go to Invoice Details tab and enter invoice number
-        inv_tab = wait_for_element(driver, *INVOICE_DETAILS_TAB, timeout=10, clickable=True)
-        inv_tab.click()
+        # Enter invoice number
+        enter_invoice_number(driver, row.invoice)
 
-        inv_input = wait_for_element(driver, *INVOICE_INPUT, timeout=10)
-        inv_input.clear()
-        inv_input.send_keys(row.invoice)
-        log.info("Entered invoice number: %s", row.invoice)
-
-        # Handle charges for leg 1
+        # Add charges for leg 1
         if row.has_charges_leg1:
-            charges_tab = wait_for_element(driver, *CHARGES_TAB, timeout=10, clickable=True)
-            charges_tab.click()
             add_charge(driver, row.charge_type_1, row.charge_amount_1)
-            log.info("Added charge for leg 1: %s = $%s", row.charge_type_1, row.charge_amount_1)
 
-        # Handle charges for leg 2 (collective invoice)
+        # Add charges for leg 2 (collective invoice)
         if row.is_collective and row.has_charges_leg2:
             add_charge(driver, row.charge_type_2, row.charge_amount_2)
-            log.info("Added charge for leg 2: %s = $%s", row.charge_type_2, row.charge_amount_2)
 
         # Submit
-        result = click_submit(
-            driver,
-            invoice_num=row.invoice,
-            doc_desc=doc_desc,
-            dry_run=dry_run,
-            step_through=step_through,
-        )
+        click_submit(driver, invoice_num=row.invoice, dry_run=dry_run, step_through=step_through)
 
-        if result == "skipped":
-            # Navigate back for skipped items
-            try:
-                driver.find_element(*BACK_BUTTON).click()
-            except NoSuchElementException:
-                driver.back()
-            return "skipped"
+        if dry_run:
+            click_back(driver)
+            return "dry_run"
 
         return "submitted"
 
     except Exception as e:
         log.error("Error processing %s: %s", doc_desc, e, exc_info=True)
         take_screenshot(driver, f"tile3_error_{row.document_1}")
-        # Try to navigate back to the list
         try:
-            driver.find_element(*BACK_BUTTON).click()
+            click_back(driver)
         except Exception:
-            try:
-                driver.back()
-            except Exception:
-                pass
-        return "error"
+            pass
+        return f"error: {str(e)[:100]}"
 
 
-def run(driver: WebDriver, rows: list[InvoiceRow],
-        *, dry_run: bool = False, step_through: bool = False, **_kwargs):
-    """Execute the full Tile 3 workflow.
+def run(driver: WebDriver, *, dry_run: bool = False, step_through: bool = False, **_kwargs):
+    """Execute the full Tile 3 workflow using Google Sheets."""
+    import os
+    launchpad_url = os.environ.get("SAP_LAUNCHPAD_URL", "")
 
-    Returns dict with counts: submitted, drafted, skipped, error.
-    """
+    rows = read_todo_items()
+    if not rows:
+        log.info("No items in To Do tab — nothing to invoice")
+        return {"submitted": 0, "errors": 0}
+
+    log.info("Found %d items in To Do tab", len(rows))
+    results = {"submitted": 0, "drafted": 0, "skipped": 0, "errors": 0}
+
     navigate_to_tile(driver)
 
-    results = {"submitted": 0, "drafted": 0, "skipped": 0, "error": 0}
-
     for i, row in enumerate(rows):
-        log.info("── Row %d/%d (Excel row %d) ──", i + 1, len(rows), row.row_number)
+        log.info("════ Invoice %d/%d (doc %s) ════", i + 1, len(rows), row.document_1)
+
         status = process_row(driver, row, dry_run=dry_run, step_through=step_through)
-        results[status] += 1
         log.info("Result: %s", status)
 
-    log.info("Tile 3 complete — %s", results)
-    print(f"\nTile 3 Summary: {results['submitted']} submitted, "
-          f"{results['drafted']} drafted, {results['skipped']} skipped, "
-          f"{results['error']} errors")
+        if status == "submitted":
+            results["submitted"] += 1
+            move_to_status(row, "done")
+        elif status == "dry_run":
+            results["skipped"] += 1
+        elif status.startswith("error:"):
+            results["errors"] += 1
+            mark_error(row, status.replace("error: ", ""))
+        else:
+            results["drafted"] += 1
+            mark_error(row, status)
+
+        # Navigate back to tile for next item
+        if i < len(rows) - 1:
+            if launchpad_url:
+                driver.get(launchpad_url)
+                wait_for_page_ready(driver)
+            navigate_to_tile(driver)
+
+    log.info("Tile 3 complete: %s", results)
     return results

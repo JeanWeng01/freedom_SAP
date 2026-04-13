@@ -1,298 +1,339 @@
 """Tile 4 — Manage Freight Execution / POD Upload.
 
-Goal: For each freight order, upload the correct PDF to every "Proof of..." window
-across all stops. Human-gated.
+Goal: For each freight order, upload the correct PDF from Google Drive
+to every "Proof of..." section across all stops. Human-gated.
 
-Based on screenshots: the detail page has stops (Stop 1, Stop 2, ...) each with
-"Proof of Pick-Up" or "Proof of Delivery" sections. Click "Expand All" first,
-then for each stop find the "Proof of..." section and click Report → upload PDF.
+Workflow per item:
+1. Click into the item (middle column, NOT radio button)
+2. Click "Expand All" to show all stops
+3. For each stop, find "Proof of Pick-Up" or "Proof of Delivery" section
+4. Click "Report" → Browse → upload PDF from Google Drive
+5. Same PDF uploaded to every Proof section
+6. Back to list, next item
 """
 
 import os
 import logging
+import time as _time
 from selenium.webdriver.remote.webdriver import WebDriver
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.action_chains import ActionChains
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
 from bot.utils import (
-    wait_for_element, wait_for_elements, wait_until_gone,
-    scroll_to_load_all, take_screenshot, destructive_action, click_tile,
+    wait_for_element, wait_for_page_ready, take_screenshot,
+    destructive_action, click_tile,
 )
-from bot.excel_reader import InvoiceRow
+from bot.google_sheets import InvoiceRow, read_todo_items, move_to_status, mark_error
+from bot.google_drive import download_file, cleanup_temp_file
 
 log = logging.getLogger(__name__)
 
 TILE_NAME = "Manage Freight Execution"
 
-# ── Selectors (refined from manage_freight_execution screenshots) ───────────
-
-# ── List page selectors ────────────────────────────────────────────────────
-
-# Tabs on the list page
-DOCUMENTS_FOR_REPORTING_TAB = (By.XPATH,
-    "//*[contains(text(),'Documents for Reporting')]/.."
-)
-
-# Freight document rows in the list table
-ORDER_ROWS = (By.CSS_SELECTOR,
-    "table tbody tr"
-)
-
-# ── Detail page selectors ──────────────────────────────────────────────────
-
-# "Expand All" button (top-right of detail page)
-EXPAND_ALL_BTN = (By.XPATH,
-    "//button[.//bdi[text()='Expand All'] or .//span[text()='Expand All']]"
-    " | //a[contains(text(),'Expand All')]"
-)
-
-# Stop sections — "Stop 1 - ...", "Stop 2 - ..." headers
-STOP_HEADERS = (By.XPATH,
-    "//span[starts-with(text(),'Stop ') and contains(text(),' - ')]"
-)
-
-# "Proof of Pick-Up" or "Proof of Delivery" section headers
-PROOF_HEADERS = (By.XPATH,
-    "//span[starts-with(text(),'Proof of ')]"
-)
-
-# "Report" button next to each "Proof of..." section
-# In the screenshot, each Proof section has its own "Report" link/button
-PROOF_REPORT_BTN = (By.XPATH,
-    "//a[text()='Report'] | //button[.//bdi[text()='Report'] or .//span[text()='Report']]"
-)
-
-# ── Upload popup selectors ──────────────────────────────────────────────────
-
-# File input for upload (hidden input[type=file] used by Browse button)
-FILE_INPUT = (By.CSS_SELECTOR, "input[type='file']")
-
-# Browse button in popup
-BROWSE_BUTTON = (By.XPATH,
-    "//button[.//bdi[text()='Browse...'] or .//span[text()='Browse...']]"
-    " | //button[contains(@id,'browse') or contains(@id,'Browse')]"
-)
-
-# Upload / OK / Confirm button in popup
-UPLOAD_CONFIRM_BTN = (By.XPATH,
-    "//div[contains(@class,'sapMDialog')]//button[.//bdi[text()='OK']]"
-    " | //div[contains(@class,'sapMDialog')]//button[.//bdi[text()='Upload']]"
-    " | //div[contains(@class,'sapMDialog')]//button[.//bdi[text()='Report']]"
-)
-
-# Back / navigation
 BACK_BUTTON = (By.CSS_SELECTOR,
     "button[title='Back'], .sapMNavBack, .sapUshellShellHeadItm[title='Back']"
 )
 
-# Information / Attachments tabs on detail page
-ATTACHMENTS_TAB = (By.XPATH,
-    "//*[contains(text(),'Attachments')]/.."
-)
-
 
 def navigate_to_tile(driver: WebDriver):
-    """Click the Manage Freight Execution tile."""
+    """Click the Manage Freight Execution tile and wait for it to load."""
     click_tile(driver, TILE_NAME)
+    from selenium.webdriver.support.ui import WebDriverWait
+    try:
+        WebDriverWait(driver, 30).until(
+            lambda d: d.execute_script("""
+                var spans = document.querySelectorAll('span');
+                for (var i = 0; i < spans.length; i++) {
+                    if (spans[i].offsetParent === null) continue;
+                    var t = spans[i].textContent.replace(/\\xAD/g, '').trim();
+                    if (/Freight Documents \\(/.test(t)) return true;
+                    if (t.indexOf('Documents for Reporting') !== -1) return true;
+                }
+                return false;
+            """)
+        )
+    except TimeoutException:
+        log.warning("Tile 4 page content not detected — retrying")
+        launchpad_url = os.environ.get("SAP_LAUNCHPAD_URL", "")
+        if launchpad_url:
+            driver.get(launchpad_url)
+            wait_for_page_ready(driver)
+        click_tile(driver, TILE_NAME)
+        _time.sleep(10)
+    wait_for_page_ready(driver)
+    take_screenshot(driver, "tile4_page_loaded")
     log.info("Tile 4 page loaded")
 
 
-def click_into_order(driver: WebDriver, row_index: int) -> bool:
-    """Click into a freight order from the list by clicking a middle column cell.
-
-    DO NOT click the radio button — click a data cell like 'Current Status' or
-    'Departure Location'.
-    """
-    try:
-        rows = driver.find_elements(*ORDER_ROWS)
-        if row_index >= len(rows):
-            log.warning("Row index %d out of range (%d rows)", row_index, len(rows))
-            return False
-
-        row = rows[row_index]
-        cells = row.find_elements(By.TAG_NAME, "td")
-        # Click on a middle column (e.g. "Reporting Status" — roughly column 5-6)
-        target_cell = cells[min(5, len(cells) - 1)] if len(cells) > 1 else row
-        target_cell.click()
-        log.info("Clicked into freight order at row %d", row_index)
+def dismiss_any_popup(driver: WebDriver) -> bool:
+    """Dismiss any popup dialog."""
+    result = driver.execute_script("""
+        var dialogs = document.querySelectorAll('[class*="sapMDialog"], [role="dialog"]');
+        for (var i = dialogs.length - 1; i >= 0; i--) {
+            var d = dialogs[i];
+            if (d.offsetParent === null) continue;
+            var btns = d.querySelectorAll('button');
+            for (var j = 0; j < btns.length; j++) {
+                var t = btns[j].textContent.replace(/\\xAD/g, '').trim();
+                if (t === 'Close' || t === 'OK' || t === 'Cancel') {
+                    btns[j].click();
+                    return true;
+                }
+            }
+        }
+        return null;
+    """)
+    if result:
+        _time.sleep(1)
         return True
-    except Exception as e:
-        log.error("Could not click into order row %d: %s", row_index, e)
+    return False
+
+
+def click_into_first_row(driver: WebDriver) -> bool:
+    """Click into the first visible row by clicking a non-interactive cell."""
+    row_el = driver.execute_script("""
+        var rows = document.querySelectorAll(
+            '[role="row"].sapMListTblRow, .sapMListItems .sapMLIB, .sapMListTblRow'
+        );
+        var dataRows = [];
+        for (var i = 0; i < rows.length; i++) {
+            if (rows[i].closest('thead')) continue;
+            if (rows[i].classList.contains('sapMListTblHeader')) continue;
+            if (rows[i].textContent.trim().length > 0) dataRows.push(rows[i]);
+        }
+        return dataRows.length > 0 ? dataRows[0] : null;
+    """)
+
+    if not row_el:
+        log.error("No data rows found")
         return False
 
-
-def expand_all_stops(driver: WebDriver):
-    """Click 'Expand All' to open all stop sections."""
     try:
-        btn = wait_for_element(driver, *EXPAND_ALL_BTN, timeout=10, clickable=True)
-        btn.click()
-        log.info("Clicked 'Expand All'")
-    except TimeoutException:
-        log.info("'Expand All' button not found — stops may already be expanded")
+        row_el.click()
+        log.info("Clicked into first row (native)")
+    except Exception:
+        ActionChains(driver).move_to_element(row_el).click().perform()
+        log.info("Clicked into first row (ActionChains)")
 
-
-@destructive_action("Upload POD {file_path} for {proof_label}")
-def upload_pod_file(driver: WebDriver, file_path: str, *, proof_label: str = ""):
-    """Upload a PDF file through the file input."""
-    take_screenshot(driver, f"tile4_before_upload_{proof_label}")
-
-    # Selenium can send the file path directly to input[type=file]
-    try:
-        file_input = driver.find_element(*FILE_INPUT)
-        file_input.send_keys(file_path)
-        log.info("Uploaded file via input: %s", file_path)
-    except NoSuchElementException:
-        log.error("File input not found for %s", proof_label)
-        take_screenshot(driver, f"tile4_file_input_missing_{proof_label}")
-        return False
-
-    # Confirm/OK the upload
-    try:
-        confirm_btn = wait_for_element(driver, *UPLOAD_CONFIRM_BTN, timeout=10, clickable=True)
-        confirm_btn.click()
-        log.info("Confirmed upload for %s", proof_label)
-    except TimeoutException:
-        log.info("No confirm button — upload may have auto-completed for %s", proof_label)
-
-    take_screenshot(driver, f"tile4_after_upload_{proof_label}")
+    _time.sleep(2)
+    wait_for_page_ready(driver)
     return True
 
 
-def find_and_upload_proofs(driver: WebDriver, pod_path: str, doc_number: str,
-                           *, dry_run: bool = False, step_through: bool = False) -> int:
-    """Find all 'Proof of...' sections on the detail page and upload the PDF to each.
-
-    Returns the number of successful uploads.
-    """
-    # Find all "Proof of ..." headers
-    proof_headers = driver.find_elements(*PROOF_HEADERS)
-    if not proof_headers:
-        log.info("No 'Proof of...' sections found for %s", doc_number)
-        return 0
-
-    log.info("Found %d 'Proof of...' sections for %s", len(proof_headers), doc_number)
-
-    # Find all Report buttons — each "Proof of..." section has one
-    report_buttons = driver.find_elements(*PROOF_REPORT_BTN)
-    # Filter to only the Report buttons that are near/within Proof sections
-    # The Report buttons in the screenshot appear as links at the bottom of each proof section
-
-    uploads = 0
-    # We process proof sections by finding pairs of (proof_header, report_button)
-    # Since the page structure shows Report buttons after each Proof section,
-    # we match them positionally
-    for i, proof_el in enumerate(proof_headers):
-        proof_label = proof_el.text.strip()
-        safe_label = proof_label.replace(" ", "_")[:30]
-        log.info("Processing: %s (section %d/%d)", proof_label, i + 1, len(proof_headers))
-
-        # Find the closest Report button to this proof section
-        # Use the parent container to scope the search
+def click_expand_all(driver: WebDriver):
+    """Click 'Expand All' button to show all stops."""
+    btn = driver.execute_script("""
+        var links = document.querySelectorAll('a, button, span');
+        for (var i = 0; i < links.length; i++) {
+            if (links[i].offsetParent === null) continue;
+            var t = links[i].textContent.replace(/\\xAD/g, '').trim();
+            if (t === 'Expand All') return links[i];
+        }
+        return null;
+    """)
+    if btn:
         try:
-            # Try to find Report button within the same parent section
-            parent = proof_el.find_element(By.XPATH, "./ancestor::div[contains(@class,'sapUiForm') or contains(@class,'sapMPanel') or contains(@class,'sapUiVlt')][1]")
-            report_btn = parent.find_element(By.XPATH,
-                ".//a[text()='Report'] | .//button[.//bdi[text()='Report']]"
-            )
-        except NoSuchElementException:
-            # Fallback: use positional matching with all Report buttons
-            if i < len(report_buttons):
-                report_btn = report_buttons[i]
-            else:
-                log.warning("No Report button found for '%s'", proof_label)
-                continue
-
-        # Click the Report button to open the upload dialog
-        try:
-            report_btn.click()
-            log.info("Clicked Report for '%s'", proof_label)
-        except Exception as e:
-            log.error("Could not click Report for '%s': %s", proof_label, e)
-            take_screenshot(driver, f"tile4_report_click_fail_{safe_label}")
-            continue
-
-        # Upload the file
-        result = upload_pod_file(
-            driver,
-            pod_path,
-            proof_label=f"{safe_label}_{doc_number}",
-            dry_run=dry_run,
-            step_through=step_through,
-        )
-        if result and result != "skipped":
-            uploads += 1
-
-    return uploads
+            btn.click()
+        except Exception:
+            ActionChains(driver).move_to_element(btn).click().perform()
+        log.info("Clicked Expand All")
+        _time.sleep(1)
+        wait_for_page_ready(driver)
+    else:
+        log.info("Expand All not found — stops may already be expanded")
 
 
-def process_order(driver: WebDriver, row: InvoiceRow, row_index: int,
-                  *, dry_run: bool = False, step_through: bool = False) -> int:
-    """Process one freight order: open detail page, expand stops, upload PODs."""
-    pod_path = row.pod_full_path
-    if not os.path.isfile(pod_path):
-        log.error("POD file not found: %s (row %d)", pod_path, row.row_number)
-        return 0
+def get_proof_report_buttons(driver: WebDriver) -> list:
+    """Find all visible Report buttons inside 'Proof of...' sections."""
+    return driver.execute_script("""
+        var results = [];
+        // Find all "Proof of..." headers
+        var spans = document.querySelectorAll('span, h3, h4');
+        for (var i = 0; i < spans.length; i++) {
+            if (spans[i].offsetParent === null) continue;
+            var t = spans[i].textContent.replace(/\\xAD/g, '').trim();
+            if (t.indexOf('Proof of') !== -1) {
+                // Find the Report button near this section
+                var parent = spans[i].parentElement;
+                for (var j = 0; j < 8 && parent; j++) {
+                    var btns = parent.querySelectorAll('a, button');
+                    for (var k = 0; k < btns.length; k++) {
+                        var bt = btns[k].textContent.replace(/\\xAD/g, '').trim();
+                        if (bt === 'Report') {
+                            results.push({label: t, btn: btns[k]});
+                            break;
+                        }
+                    }
+                    if (results.length > 0 && results[results.length-1].label === t) break;
+                    parent = parent.parentElement;
+                }
+            }
+        }
+        return results;
+    """)
 
-    # Click into the order
-    if not click_into_order(driver, row_index):
-        return 0
 
-    # Wait for detail page to load
-    try:
-        wait_for_element(driver, *EXPAND_ALL_BTN, timeout=20)
-    except TimeoutException:
-        log.warning("Detail page may not have loaded fully for %s", row.document_1)
+@destructive_action("Upload POD for {proof_label}")
+def upload_pod(driver: WebDriver, local_path: str, *, proof_label: str = ""):
+    """Upload a PDF file after clicking the Report button in a Proof section."""
+    take_screenshot(driver, f"tile4_before_upload_{proof_label[:20]}")
 
-    # Expand all stops
-    expand_all_stops(driver)
+    # Find the file input (hidden input[type=file])
+    file_input = driver.execute_script("""
+        return document.querySelector('input[type="file"]');
+    """)
 
-    # Find and upload to all Proof sections
-    uploads = find_and_upload_proofs(
-        driver, pod_path, row.document_1,
-        dry_run=dry_run, step_through=step_through,
-    )
+    if file_input:
+        file_input.send_keys(local_path)
+        log.info("Uploaded file: %s", local_path)
+        _time.sleep(2)
+        wait_for_page_ready(driver)
+    else:
+        log.error("File input not found for %s", proof_label)
+        take_screenshot(driver, f"tile4_file_input_missing_{proof_label[:20]}")
+        return False
 
-    # Navigate back to list
+    # Confirm upload if dialog appears
+    dismiss_any_popup(driver)
+    take_screenshot(driver, f"tile4_after_upload_{proof_label[:20]}")
+    return True
+
+
+def click_back(driver: WebDriver):
+    """Navigate back with fallbacks."""
+    wait_for_page_ready(driver)
+    dismiss_any_popup(driver)
     try:
         back_btn = wait_for_element(driver, *BACK_BUTTON, timeout=10, clickable=True)
         back_btn.click()
-        log.info("Navigated back to list")
-    except TimeoutException:
-        driver.back()
-        log.info("Used browser back")
+        wait_for_page_ready(driver)
+    except Exception:
+        try:
+            driver.execute_script("""
+                var btn = document.querySelector('a#backBtn, button[title="Back"], .sapMNavBack');
+                if (btn) btn.click();
+            """)
+            wait_for_page_ready(driver)
+        except Exception:
+            driver.back()
+            wait_for_page_ready(driver)
 
-    return uploads
+
+def process_item(driver: WebDriver, row: InvoiceRow, local_pdf_path: str,
+                 *, dry_run: bool = False) -> str:
+    """Process one item: open detail, expand stops, upload PDF to all Proof sections."""
+    click_expand_all(driver)
+    take_screenshot(driver, f"tile4_detail_{row.document_1}")
+
+    proof_buttons = get_proof_report_buttons(driver)
+
+    if not proof_buttons:
+        log.warning("No 'Proof of...' sections found for %s", row.document_1)
+        return "error: no Proof sections found"
+
+    log.info("Found %d Proof sections for %s", len(proof_buttons), row.document_1)
+
+    uploads = 0
+    for i, proof in enumerate(proof_buttons):
+        label = proof.get("label", f"Proof_{i+1}") if isinstance(proof, dict) else f"Proof_{i+1}"
+        safe_label = label.replace(" ", "_")[:25]
+        log.info("Processing: %s", label)
+
+        # Click the Report button (native click)
+        btn_el = proof.get("btn") if isinstance(proof, dict) else proof
+        if btn_el:
+            try:
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn_el)
+                _time.sleep(0.5)
+                btn_el.click()
+                log.info("Clicked Report for '%s' (native)", label)
+            except Exception:
+                try:
+                    ActionChains(driver).move_to_element(btn_el).click().perform()
+                    log.info("Clicked Report for '%s' (ActionChains)", label)
+                except Exception as e:
+                    log.error("Could not click Report for '%s': %s", label, e)
+                    continue
+
+            _time.sleep(1)
+            wait_for_page_ready(driver)
+
+            result = upload_pod(driver, local_pdf_path, proof_label=safe_label,
+                                dry_run=dry_run)
+            if result and result != "skipped":
+                uploads += 1
+
+    if uploads == 0 and not dry_run:
+        return "error: no files uploaded"
+
+    return "done" if not dry_run else "dry_run"
 
 
-def run(driver: WebDriver, rows: list[InvoiceRow],
-        *, dry_run: bool = False, step_through: bool = False, **_kwargs):
-    """Execute the full Tile 4 workflow.
+def run(driver: WebDriver, *, dry_run: bool = False, **_kwargs):
+    """Execute the full Tile 4 workflow using Google Sheets + Drive."""
+    launchpad_url = os.environ.get("SAP_LAUNCHPAD_URL", "")
 
-    Returns total number of uploads.
-    """
+    rows = read_todo_items()
+    if not rows:
+        log.info("No items in To Do tab — nothing to upload")
+        return {"uploaded": 0, "errors": 0}
+
+    # Filter to rows that have a POD filename
+    pod_rows = [r for r in rows if r.pod_filename]
+    if not pod_rows:
+        log.info("No rows with POD_Filename — nothing to upload")
+        return {"uploaded": 0, "errors": 0}
+
+    log.info("Found %d items with POD files to upload", len(pod_rows))
+    results = {"uploaded": 0, "errors": 0, "skipped": 0}
+
     navigate_to_tile(driver)
 
-    # Switch to "Documents for Reporting" tab if present
-    try:
-        tab = wait_for_element(driver, *DOCUMENTS_FOR_REPORTING_TAB, timeout=10, clickable=True)
-        tab.click()
-        log.info("Switched to 'Documents for Reporting' tab")
-    except TimeoutException:
-        log.info("'Documents for Reporting' tab not found — using default view")
+    for i, row in enumerate(pod_rows):
+        log.info("════ POD Upload %d/%d (doc %s, file %s) ════",
+                 i + 1, len(pod_rows), row.document_1, row.pod_full_filename)
 
-    scroll_to_load_all(driver)
+        # Download PDF from Google Drive
+        local_path = download_file(row.pod_full_filename)
+        if not local_path:
+            log.error("PDF '%s' not found in Google Drive", row.pod_full_filename)
+            mark_error(row, f"PDF '{row.pod_full_filename}' not found in Google Drive")
+            results["errors"] += 1
+            continue
 
-    total_uploads = 0
-    for i, row in enumerate(rows):
-        log.info("── POD upload row %d/%d (Excel row %d, doc %s) ──",
-                 i + 1, len(rows), row.row_number, row.document_1)
+        try:
+            # Click into the first row in the list
+            if not click_into_first_row(driver):
+                log.error("Could not click into row")
+                mark_error(row, "could not click into freight order row")
+                results["errors"] += 1
+                continue
 
-        uploads = process_order(driver, row, row_index=0, dry_run=dry_run, step_through=step_through)
-        total_uploads += uploads
+            wait_for_page_ready(driver)
+            status = process_item(driver, row, local_path, dry_run=dry_run)
+            log.info("Result: %s", status)
 
-        # After navigating back, the list re-renders — always use index 0
-        # since the processed item moves to a different status
+            if status == "done":
+                results["uploaded"] += 1
+                # Don't move to Status here — tile 3 handles the row lifecycle
+            elif status == "dry_run":
+                results["skipped"] += 1
+            elif status.startswith("error:"):
+                results["errors"] += 1
+                mark_error(row, status.replace("error: ", ""))
 
-    log.info("Tile 4 complete — %d uploads %s",
-             total_uploads, "(dry run)" if dry_run else "")
-    return total_uploads
+            click_back(driver)
+
+        finally:
+            cleanup_temp_file(local_path)
+
+        # Re-enter tile for next item
+        if i < len(pod_rows) - 1:
+            if launchpad_url:
+                driver.get(launchpad_url)
+                wait_for_page_ready(driver)
+            navigate_to_tile(driver)
+
+    log.info("Tile 4 complete: %s", results)
+    return results
