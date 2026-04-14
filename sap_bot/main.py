@@ -115,14 +115,6 @@ def run_tiles(driver, cfg: dict, tiles: list[int]):
         print("\n  *** DRY RUN MODE — no destructive actions will be taken ***\n")
         log.info("DRY RUN MODE enabled")
 
-    # Load Excel data if tiles 3 or 4 are requested
-    excel_rows = None
-    if 3 in tiles or 4 in tiles:
-        excel_path = resolve_excel_path(cfg)
-        excel_rows = read_excel(excel_path)
-        if not excel_rows:
-            log.warning("No data rows in Excel — tiles 3 & 4 will be skipped")
-
     for tile_num in tiles:
         log.info("=" * 40)
         log.info("Starting Tile %d", tile_num)
@@ -136,18 +128,10 @@ def run_tiles(driver, cfg: dict, tiles: list[int]):
                 tile2_reporting.run(driver, dry_run=dry_run)
 
             elif tile_num == 3:
-                if excel_rows:
-                    tile3_invoicing.run(driver, excel_rows,
-                                        dry_run=dry_run, step_through=step_through)
-                else:
-                    log.warning("Skipping Tile 3 — no Excel data")
+                tile3_invoicing.run(driver, dry_run=dry_run, step_through=step_through)
 
             elif tile_num == 4:
-                if excel_rows:
-                    tile4_pod_upload.run(driver, excel_rows,
-                                         dry_run=dry_run, step_through=step_through)
-                else:
-                    log.warning("Skipping Tile 4 — no Excel data")
+                tile4_pod_upload.run(driver, dry_run=dry_run)
 
         except KeyboardInterrupt:
             log.info("User interrupted at Tile %d", tile_num)

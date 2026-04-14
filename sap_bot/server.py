@@ -178,8 +178,23 @@ def cleanup_old_logs(max_age_days: int = 7):
                 pass
 
 
+def run_tile_with_retry(tile_num: int, dry_run: bool = False, max_retries: int = 1) -> dict:
+    """Run a tile with retry on failure."""
+    for attempt in range(1, max_retries + 2):
+        result = run_tile(tile_num, dry_run=dry_run)
+        if result.get("status") != "error":
+            return result
+        if attempt <= max_retries:
+            log.warning("Tile %d failed (attempt %d) — retrying in 30s...", tile_num, attempt)
+            import time
+            time.sleep(30)
+        else:
+            log.error("Tile %d failed after %d attempts", tile_num, attempt)
+    return result
+
+
 def run_auto_cycle_12():
-    """Run tiles 1 & 2 in sequence (around the clock)."""
+    """Run tiles 1 & 2 in sequence with retry."""
     log.info("═══ Tiles 1 & 2 auto cycle starting ═══")
     cleanup_old_logs(max_age_days=7)
     run_status["last_auto_run"] = datetime.now().isoformat()
@@ -187,59 +202,84 @@ def run_auto_cycle_12():
     dry_run = CFG.get("dry_run", True)
 
     for tile_num in [1, 2]:
-        result = run_tile(tile_num, dry_run=dry_run)
+        result = run_tile_with_retry(tile_num, dry_run=dry_run, max_retries=1)
         log.info("Tile %d result: %s", tile_num, result.get("status"))
 
     log.info("═══ Tiles 1 & 2 auto cycle complete ═══")
 
 
 def run_auto_cycle_34():
-    """Run tiles 3 & 4 in sequence (only during 4am-9am window)."""
+    """Run tiles 3 & 4 in sequence with retry."""
     log.info("═══ Tiles 3 & 4 auto cycle starting ═══")
     run_status["last_invoice_run"] = datetime.now().isoformat()
 
     dry_run = CFG.get("dry_run", True)
 
     for tile_num in [3, 4]:
-        result = run_tile(tile_num, dry_run=dry_run)
+        result = run_tile_with_retry(tile_num, dry_run=dry_run, max_retries=1)
         log.info("Tile %d result: %s", tile_num, result.get("status"))
 
     log.info("═══ Tiles 3 & 4 auto cycle complete ═══")
 
 
 def is_in_invoice_window() -> bool:
-    """Check if current time is within the 4am-9am invoice processing window."""
+    """Check if current time is within the daytime window (9am-9pm) and NOT 4am-9am."""
     hour = datetime.now().hour
-    return 4 <= hour < 9
+    return 9 <= hour < 21
 
 
 # ── Auto-schedulers (background threads) ────────────────────────────────────
 
+# Tiles 1 & 2 run times (ET): 9am, 12pm, 3pm
+TILE12_RUN_HOURS = [int(h) for h in os.environ.get("TILE12_RUN_HOURS", "9,12,15").split(",")]
+
+# Tiles 3 & 4: disabled by default, enable via env var ENABLE_TILES_34=true
+TILES_34_ENABLED = os.environ.get("ENABLE_TILES_34", "false").lower() == "true"
+TILE34_INTERVAL_MINUTES = int(os.environ.get("TILE34_INTERVAL_MINUTES", "180"))
+
+
 def scheduler_loop_12():
-    """Run tiles 1 & 2 on a fixed interval (24/7)."""
+    """Run tiles 1 & 2 at specific hours (default: 9am, 12pm, 3pm ET)."""
     import time
-    interval = int(os.environ.get("INTERVAL_MINUTES", CFG.get("autonomous_interval_minutes", 120))) * 60
-    log.info("Tiles 1 & 2 scheduler started — every %d minutes", interval // 60)
+    log.info("Tiles 1 & 2 scheduler started — runs at hours: %s", TILE12_RUN_HOURS)
+
+    already_ran_this_hour = None
 
     while True:
-        try:
-            run_auto_cycle_12()
-        except Exception as e:
-            log.error("Tiles 1 & 2 auto cycle error: %s", e, exc_info=True)
+        now = datetime.now()
+        current_hour = now.hour
 
-        next_run = datetime.fromtimestamp(
-            datetime.now().timestamp() + interval
-        ).isoformat()
-        run_status["next_auto_run"] = next_run
-        log.info("Next tiles 1 & 2 run at %s", next_run)
-        time.sleep(interval)
+        if current_hour in TILE12_RUN_HOURS and already_ran_this_hour != current_hour:
+            already_ran_this_hour = current_hour
+            try:
+                run_auto_cycle_12()
+            except Exception as e:
+                log.error("Tiles 1 & 2 auto cycle error: %s", e, exc_info=True)
+
+            # Update next run time
+            remaining_hours = [h for h in TILE12_RUN_HOURS if h > current_hour]
+            if remaining_hours:
+                next_hour = remaining_hours[0]
+                next_run = now.replace(hour=next_hour, minute=0, second=0).isoformat()
+            else:
+                next_run = f"tomorrow at {TILE12_RUN_HOURS[0]}:00"
+            run_status["next_auto_run"] = next_run
+            log.info("Next tiles 1 & 2 run: %s", next_run)
+
+        time.sleep(60)  # check every minute
 
 
 def scheduler_loop_34():
-    """Run tiles 3 & 4 during the 4am-9am window, check every 30 minutes."""
+    """Run tiles 3 & 4 every N hours during daytime (not 4am-9am). Disabled by default."""
     import time
-    check_interval = 30 * 60  # check every 30 min
-    log.info("Tiles 3 & 4 scheduler started — runs during 4am-9am window")
+
+    if not TILES_34_ENABLED:
+        log.info("Tiles 3 & 4 scheduler DISABLED (set ENABLE_TILES_34=true to enable)")
+        return  # exit thread entirely
+
+    interval = TILE34_INTERVAL_MINUTES * 60
+    log.info("Tiles 3 & 4 scheduler started — every %d min during daytime (not 4am-9am)",
+             TILE34_INTERVAL_MINUTES)
 
     while True:
         if is_in_invoice_window():
@@ -248,9 +288,9 @@ def scheduler_loop_34():
             except Exception as e:
                 log.error("Tiles 3 & 4 auto cycle error: %s", e, exc_info=True)
         else:
-            log.debug("Outside 4am-9am window — skipping tiles 3 & 4")
+            log.debug("Outside daytime window — skipping tiles 3 & 4")
 
-        time.sleep(check_interval)
+        time.sleep(interval)
 
 
 # ── Flask app ───────────────────────────────────────────────────────────────

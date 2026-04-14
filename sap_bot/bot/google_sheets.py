@@ -178,12 +178,26 @@ def move_to_status(item: InvoiceRow, status: str):
     service = _get_sheets_service()
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # Pad raw_values to 11 columns (A-K), then add Processed_At (L) and Status (M)
-    row_data = list(item.raw_values)
-    while len(row_data) < 11:
-        row_data.append("")
-    row_data.append(timestamp)  # col L: Processed_At
-    row_data.append(status)     # col M: Status
+    # Reconstruct row from parsed fields to guarantee column alignment
+    # A: Document_1, B: Invoice, C: POD_Filename, D: Charge_Hrs_1,
+    # E: Charge_Type_1, F: Amount_1, G: (blank), H: Document_2,
+    # I: Charge_Hrs_2, J: Charge_Type_2, K: Amount_2,
+    # L: Processed_At, M: Status
+    row_data = [
+        item.document_1,
+        item.invoice,
+        item.pod_filename,
+        item.charge_hours_1 if item.charge_hours_1 is not None else "",
+        item.charge_type_1 or "",
+        item.charge_amount_1 if item.charge_amount_1 is not None else "",
+        "",  # G: blank spacer
+        item.document_2 or "",
+        item.charge_hours_2 if item.charge_hours_2 is not None else "",
+        item.charge_type_2 or "",
+        item.charge_amount_2 if item.charge_amount_2 is not None else "",
+        timestamp,  # L: Processed_At
+        status,     # M: Status
+    ]
 
     # Append to Status tab
     service.spreadsheets().values().append(

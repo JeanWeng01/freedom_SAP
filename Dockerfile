@@ -22,9 +22,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy bot code
 COPY sap_bot/ .
 
+# Install timezone data for ET
+RUN apt-get update && apt-get install -y --no-install-recommends tzdata && rm -rf /var/lib/apt/lists/*
+
 # Railway sets PORT env var
 ENV HEADLESS=true
 ENV PYTHONUNBUFFERED=1
+ENV TZ=America/New_York
 
 EXPOSE 8080
 

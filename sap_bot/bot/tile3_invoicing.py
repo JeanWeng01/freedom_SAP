@@ -165,21 +165,38 @@ def filter_collective_documents(driver: WebDriver, doc1: str, doc2: str):
 
 
 def select_all_visible_rows(driver: WebDriver):
-    """Select all visible document rows by clicking each checkbox."""
-    driver.execute_script("""
+    """Select all visible document rows using native Selenium clicks on checkboxes."""
+    # Find all visible checkboxes in data rows
+    checkboxes = driver.execute_script("""
+        var cbs = [];
         var rows = document.querySelectorAll('.sapMListItems .sapMLIB, .sapMListTblRow');
         for (var i = 0; i < rows.length; i++) {
             if (rows[i].offsetParent === null) continue;
+            if (rows[i].classList.contains('sapMListTblHeader')) continue;
             var cb = rows[i].querySelector('.sapMCb');
-            if (cb && !cb.classList.contains('sapMCbMarkChecked')) cb.click();
+            if (cb && cb.offsetParent !== null) cbs.push(cb);
         }
+        return cbs;
     """)
-    log.info("Selected all visible rows")
+
+    selected = 0
+    for cb in checkboxes:
+        try:
+            cb.click()  # native Selenium click
+            selected += 1
+        except Exception:
+            try:
+                ActionChains(driver).move_to_element(cb).click().perform()
+                selected += 1
+            except Exception as e:
+                log.warning("Could not click checkbox: %s", e)
+
+    log.info("Selected %d rows (native clicks)", selected)
     _time.sleep(0.5)
 
 
 def click_create_invoice(driver: WebDriver, collective: bool) -> bool:
-    """Click Create Invoice or Create Collective Invoice button. Returns True if invoice page opened."""
+    """Click Create Invoice or Create Collective Invoice button."""
     button_text = "Create Collective Invoice" if collective else "Create Invoice"
     btn = driver.execute_script("""
         var target = arguments[0];
@@ -404,6 +421,220 @@ def click_back(driver: WebDriver):
             wait_for_page_ready(driver)
 
 
+def fill_invoice_and_submit(driver: WebDriver, row: InvoiceRow,
+                            *, dry_run: bool = False, step_through: bool = False) -> str:
+    """Fill invoice number, add charges, and submit. Called when invoice page is open."""
+    enter_invoice_number(driver, row.invoice)
+
+    if row.has_charges_leg1:
+        add_charge(driver, row.charge_type_1, row.charge_amount_1)
+
+    if row.is_collective and row.has_charges_leg2:
+        add_charge(driver, row.charge_type_2, row.charge_amount_2)
+
+    click_submit(driver, invoice_num=row.invoice, dry_run=dry_run, step_through=step_through)
+
+    if dry_run:
+        click_back(driver)
+        return "dry_run"
+
+    return "submitted"
+
+
+def navigate_to_manage_invoices(driver: WebDriver):
+    """Navigate to the Manage Invoices tile."""
+    click_tile(driver, "Manage Invoices")
+    from selenium.webdriver.support.ui import WebDriverWait
+    try:
+        WebDriverWait(driver, 30).until(
+            lambda d: d.execute_script("""
+                var spans = document.querySelectorAll('span');
+                for (var i = 0; i < spans.length; i++) {
+                    if (spans[i].offsetParent === null) continue;
+                    var t = spans[i].textContent.replace(/\\xAD/g, '').trim();
+                    if (t.indexOf('Draft') !== -1 || t.indexOf('Invoicing in Process') !== -1) return true;
+                }
+                return false;
+            """)
+        )
+    except TimeoutException:
+        log.warning("Manage Invoices page content not detected — retrying")
+        import os
+        launchpad_url = os.environ.get("SAP_LAUNCHPAD_URL", "")
+        if launchpad_url:
+            driver.get(launchpad_url)
+            wait_for_page_ready(driver)
+        click_tile(driver, "Manage Invoices")
+        _time.sleep(10)
+    wait_for_page_ready(driver)
+    take_screenshot(driver, "tile3_manage_invoices_loaded")
+    log.info("Manage Invoices page loaded")
+
+
+def click_drafts_tab(driver: WebDriver):
+    """Click the 'Draft' tab in Manage Invoices."""
+    driver.execute_script("""
+        var spans = document.querySelectorAll('span');
+        for (var i = 0; i < spans.length; i++) {
+            if (spans[i].offsetParent === null) continue;
+            var clean = spans[i].textContent.replace(/\\xAD/g, '').trim();
+            if (/^Draft/.test(clean)) {
+                var tab = spans[i].closest('[role="tab"], [class*="sapMITBFilter"], [class*="sapMITBItem"]');
+                if (tab) { tab.click(); return; }
+                spans[i].click();
+                return;
+            }
+        }
+    """)
+    wait_for_page_ready(driver)
+    log.info("Clicked Drafts tab")
+    take_screenshot(driver, "tile3_drafts_tab")
+
+
+def filter_in_manage_invoices(driver: WebDriver, doc1: str, doc2: str = None):
+    """Filter for freight document(s) in the Manage Invoices tile."""
+    # Find the Freight Document filter input
+    input_el = driver.execute_script("""
+        var labels = document.querySelectorAll('label, span');
+        for (var i = 0; i < labels.length; i++) {
+            var clean = labels[i].textContent.replace(/\\xAD/g, '').trim();
+            if (clean.indexOf('Freight Document') !== -1) {
+                var parent = labels[i].parentElement;
+                for (var j = 0; j < 5 && parent; j++) {
+                    var input = parent.querySelector('input:not([type="hidden"])');
+                    if (input) return input;
+                    parent = parent.parentElement;
+                }
+            }
+        }
+        var inputs = document.querySelectorAll('input');
+        for (var i = 0; i < inputs.length; i++) {
+            var ph = (inputs[i].placeholder || '').toLowerCase();
+            var al = (inputs[i].getAttribute('aria-label') || '').toLowerCase();
+            if (ph.indexOf('freight doc') !== -1 || al.indexOf('freight doc') !== -1) return inputs[i];
+        }
+        return null;
+    """)
+    if not input_el:
+        log.error("Filter input not found in Manage Invoices")
+        take_screenshot(driver, "tile3_manage_inv_filter_missing")
+        return
+
+    input_el.click()
+    _time.sleep(0.3)
+    input_el.clear()
+    input_el.send_keys(doc1)
+    input_el.send_keys(Keys.RETURN)
+    if doc2:
+        _time.sleep(1)
+        input_el.send_keys(doc2)
+        input_el.send_keys(Keys.RETURN)
+    log.info("Filtered in Manage Invoices for: %s%s", doc1, f" + {doc2}" if doc2 else "")
+    wait_for_page_ready(driver)
+
+
+def click_into_draft_row(driver: WebDriver) -> bool:
+    """Click into the first visible row in the Drafts list (native click on a safe cell)."""
+    row_el = driver.execute_script("""
+        var rows = document.querySelectorAll(
+            '[role="row"].sapMListTblRow, .sapMListItems .sapMLIB, .sapMListTblRow'
+        );
+        var dataRows = [];
+        for (var i = 0; i < rows.length; i++) {
+            if (rows[i].closest('thead')) continue;
+            if (rows[i].classList.contains('sapMListTblHeader')) continue;
+            if (rows[i].textContent.trim().length > 0) dataRows.push(rows[i]);
+        }
+        return dataRows.length > 0 ? dataRows[0] : null;
+    """)
+
+    if not row_el:
+        log.error("No draft rows found")
+        take_screenshot(driver, "tile3_no_draft_rows")
+        return False
+
+    try:
+        row_el.click()
+        log.info("Clicked into draft row (native)")
+    except Exception:
+        ActionChains(driver).move_to_element(row_el).click().perform()
+        log.info("Clicked into draft row (ActionChains)")
+
+    _time.sleep(2)
+    wait_for_page_ready(driver)
+    return True
+
+
+def process_drafted_invoice(driver: WebDriver, row: InvoiceRow,
+                            *, dry_run: bool = False, step_through: bool = False) -> str:
+    """Recover a drafted invoice from Manage Invoices tile.
+
+    Flow: go to Manage Invoices → Drafts tab → filter → click into draft →
+    fill invoice number + charges → submit.
+    """
+    import os
+    launchpad_url = os.environ.get("SAP_LAUNCHPAD_URL", "")
+
+    doc_desc = row.document_1
+    if row.is_collective:
+        doc_desc = f"{row.document_1} + {row.document_2}"
+
+    log.info("Recovering drafted invoice for %s", doc_desc)
+
+    try:
+        # Go to home first
+        if launchpad_url:
+            driver.get(launchpad_url)
+            wait_for_page_ready(driver)
+
+        # Navigate to Manage Invoices tile
+        navigate_to_manage_invoices(driver)
+
+        # Click Drafts tab
+        click_drafts_tab(driver)
+
+        # Filter for the freight document(s)
+        filter_in_manage_invoices(driver, row.document_1,
+                                  row.document_2 if row.is_collective else None)
+
+        take_screenshot(driver, f"tile3_draft_filtered_{row.document_1}")
+
+        # Click into the draft
+        if not click_into_draft_row(driver):
+            return "error: draft invoice not found in Manage Invoices"
+
+        take_screenshot(driver, f"tile3_draft_opened_{row.document_1}")
+
+        # Check that invoice page opened
+        on_invoice = driver.execute_script("""
+            var spans = document.querySelectorAll('span');
+            for (var i = 0; i < spans.length; i++) {
+                if (spans[i].offsetParent === null) continue;
+                var t = spans[i].textContent.replace(/\\xAD/g, '').trim();
+                if (t === 'Invoice Details') return true;
+            }
+            return false;
+        """)
+
+        if not on_invoice:
+            log.error("Draft invoice page did not open for %s", doc_desc)
+            take_screenshot(driver, f"tile3_draft_no_page_{row.document_1}")
+            click_back(driver)
+            return "error: could not open draft invoice"
+
+        # Fill invoice number, add charges, submit
+        return fill_invoice_and_submit(driver, row, dry_run=dry_run, step_through=step_through)
+
+    except Exception as e:
+        log.error("Error recovering draft for %s: %s", doc_desc, e, exc_info=True)
+        take_screenshot(driver, f"tile3_draft_error_{row.document_1}")
+        try:
+            click_back(driver)
+        except Exception:
+            pass
+        return f"error: draft recovery failed - {str(e)[:80]}"
+
+
 def process_row(driver: WebDriver, row: InvoiceRow,
                 *, dry_run: bool = False, step_through: bool = False) -> str:
     """Process one row from Google Sheet. Returns 'submitted', 'drafted', 'skipped', or error message."""
@@ -441,30 +672,26 @@ def process_row(driver: WebDriver, row: InvoiceRow,
         """)
 
         if not on_invoice:
-            log.warning("Invoice page did not open for %s — may have gone to Drafts", doc_desc)
+            # Check if there's an error popup (e.g. "invoice created" → went to drafts)
+            error_text = driver.execute_script("""
+                var dialogs = document.querySelectorAll('[class*="sapMDialog"], [role="dialog"]');
+                for (var i = dialogs.length - 1; i >= 0; i--) {
+                    var d = dialogs[i];
+                    if (d.offsetParent === null) continue;
+                    return d.textContent.substring(0, 300).trim();
+                }
+                return null;
+            """)
+            if error_text:
+                log.warning("Popup for %s: %s", doc_desc, error_text[:150])
+                dismiss_any_popup(driver)
+
+            log.info("Invoice went to Drafts for %s — will retrieve from Manage Invoices", doc_desc)
             take_screenshot(driver, f"tile3_draft_{row.document_1}")
-            click_back(driver)
-            return "error: went to Drafts instead of invoice page"
+            return "drafted"
 
-        # Enter invoice number
-        enter_invoice_number(driver, row.invoice)
-
-        # Add charges for leg 1
-        if row.has_charges_leg1:
-            add_charge(driver, row.charge_type_1, row.charge_amount_1)
-
-        # Add charges for leg 2 (collective invoice)
-        if row.is_collective and row.has_charges_leg2:
-            add_charge(driver, row.charge_type_2, row.charge_amount_2)
-
-        # Submit
-        click_submit(driver, invoice_num=row.invoice, dry_run=dry_run, step_through=step_through)
-
-        if dry_run:
-            click_back(driver)
-            return "dry_run"
-
-        return "submitted"
+        # Invoice page opened directly — fill it here
+        return fill_invoice_and_submit(driver, row, dry_run=dry_run, step_through=step_through)
 
     except Exception as e:
         log.error("Error processing %s: %s", doc_desc, e, exc_info=True)
@@ -502,14 +729,26 @@ def run(driver: WebDriver, *, dry_run: bool = False, step_through: bool = False,
             move_to_status(row, "done")
         elif status == "dry_run":
             results["skipped"] += 1
+        elif status == "drafted":
+            # Invoice went to Drafts — recover it from Manage Invoices
+            log.info("Attempting to recover drafted invoice for %s", row.document_1)
+            draft_status = process_drafted_invoice(driver, row,
+                                                    dry_run=dry_run, step_through=step_through)
+            log.info("Draft recovery result: %s", draft_status)
+
+            if draft_status == "submitted":
+                results["submitted"] += 1
+                move_to_status(row, "done (recovered from drafts)")
+            elif draft_status == "dry_run":
+                results["skipped"] += 1
+            else:
+                results["errors"] += 1
+                mark_error(row, draft_status.replace("error: ", ""))
         elif status.startswith("error:"):
             results["errors"] += 1
             mark_error(row, status.replace("error: ", ""))
-        else:
-            results["drafted"] += 1
-            mark_error(row, status)
 
-        # Navigate back to tile for next item
+        # Navigate back to Invoice Freight Documents tile for next item
         if i < len(rows) - 1:
             if launchpad_url:
                 driver.get(launchpad_url)
