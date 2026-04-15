@@ -2,11 +2,16 @@
 
 Sheet layout:
   "To Do" tab — items for bot to process
-    A: Document_1    B: Invoice       C: POD_Filename   D: Charge_Hrs_1
-    E: Charge_Type_1 F: Amount_1      G: (blank spacer)
-    H: Document_2    I: Charge_Hrs_2  J: Charge_Type_2  K: Amount_2
+    A: Document_1    B: Document_2    C: Invoice       D: POD_Filename
+    E: Charge_Hrs_1  F: Charge_Hrs_2  G: Pause (1 = skip submit, save instead)
 
-  "Status" tab — completed/errored items (same columns + L: Processed_At, M: Status)
+  "Status" tab — completed items (same A-F columns + processing info)
+    A-F: same as To Do
+    G: Processed_At_1   (tile 3 timestamp)
+    H: Processed_At_2   (tile 4 timestamp)
+    I: POD_Uploaded_1    ("done" or error)
+    J: POD_Uploaded_2    ("done" or error)
+    K: Status            ("done" or "error: ...")
 """
 
 import os
@@ -28,34 +33,27 @@ TODO_TAB = "To Do"
 STATUS_TAB = "Status"
 
 # Column indices (0-based) in the To Do tab
-COL_DOC1 = 0        # A
-COL_INVOICE = 1      # B
-COL_POD_FILENAME = 2 # C
-COL_CHARGE_HRS1 = 3  # D
-COL_CHARGE_TYPE1 = 4 # E
-COL_AMOUNT1 = 5      # F
-# G is blank spacer
-COL_DOC2 = 7         # H
-COL_CHARGE_HRS2 = 8  # I
-COL_CHARGE_TYPE2 = 9 # J
-COL_AMOUNT2 = 10     # K
+COL_DOC1 = 0         # A
+COL_DOC2 = 1         # B
+COL_INVOICE = 2      # C
+COL_POD_FILENAME = 3 # D
+COL_CHARGE_HRS1 = 4  # E
+COL_CHARGE_HRS2 = 5  # F
+COL_PAUSE = 6        # G
+COL_TODO_STATUS = 7  # H — bot writes: "invoiced", "paused"
 
 
 @dataclass
 class InvoiceRow:
     """One row from the Google Sheet To Do tab."""
-    sheet_row: int  # 1-based row number in the sheet (for writing back)
-    raw_values: list  # original row values
+    sheet_row: int  # 1-based row number in the sheet
     document_1: str
+    document_2: str | None
     invoice: str
     pod_filename: str
     charge_hours_1: float | None
-    charge_type_1: str | None
-    charge_amount_1: float | None
-    document_2: str | None
     charge_hours_2: float | None
-    charge_type_2: str | None
-    charge_amount_2: float | None
+    pause: bool  # True = skip submit, save instead
 
     @property
     def is_collective(self) -> bool:
@@ -63,26 +61,60 @@ class InvoiceRow:
 
     @property
     def has_charges_leg1(self) -> bool:
-        return bool(self.charge_type_1) and bool(self.charge_hours_1)
+        return bool(self.charge_hours_1)
 
     @property
     def has_charges_leg2(self) -> bool:
-        return bool(self.charge_type_2) and bool(self.charge_hours_2)
+        return bool(self.charge_hours_2)
+
+    @property
+    def charge_amount_1(self) -> float | None:
+        if self.charge_hours_1:
+            return round(self.charge_hours_1 * HOURLY_RATE, 2)
+        return None
+
+    @property
+    def charge_amount_2(self) -> float | None:
+        if self.charge_hours_2:
+            return round(self.charge_hours_2 * HOURLY_RATE, 2)
+        return None
+
+    @property
+    def charge_type_1(self) -> str | None:
+        return "Waiting Charges" if self.has_charges_leg1 else None
+
+    @property
+    def charge_type_2(self) -> str | None:
+        return "Waiting Charges" if self.has_charges_leg2 else None
 
     @property
     def pod_full_filename(self) -> str:
-        return self.pod_filename + ".pdf" if self.pod_filename else ""
+        """Returns first filename with .pdf suffix (for backwards compat)."""
+        names = self.pod_filenames
+        return names[0] if names else ""
+
+    @property
+    def pod_filenames(self) -> list[str]:
+        """Parse POD_Filename cell into list of filenames with .pdf suffix.
+
+        Supports semicolon-separated multiple files with optional spaces:
+          'VIM04E'              → ['VIM04E.pdf']
+          'VIM04E;VIM04E_2'     → ['VIM04E.pdf', 'VIM04E_2.pdf']
+          'VIM04E; VIM04E_2'    → ['VIM04E.pdf', 'VIM04E_2.pdf']
+        """
+        if not self.pod_filename:
+            return []
+        parts = [p.strip() for p in self.pod_filename.split(";")]
+        return [p + ".pdf" for p in parts if p]
 
 
 def _get_credentials():
     """Load Google service account credentials from env var or file."""
-    # Try JSON string from env var first (Railway)
     creds_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
     if creds_json:
         info = json.loads(creds_json)
         return Credentials.from_service_account_info(info, scopes=SCOPES)
 
-    # Try file path (local development)
     creds_file = os.environ.get("GOOGLE_SERVICE_ACCOUNT_FILE", "service_account.json")
     if os.path.isfile(creds_file):
         return Credentials.from_service_account_file(creds_file, scopes=SCOPES)
@@ -124,7 +156,7 @@ def read_todo_items() -> list[InvoiceRow]:
     service = _get_sheets_service()
     result = service.spreadsheets().values().get(
         spreadsheetId=SHEET_ID,
-        range=f"'{TODO_TAB}'!A:K",
+        range=f"'{TODO_TAB}'!A:H",
     ).execute()
 
     rows = result.get("values", [])
@@ -138,78 +170,138 @@ def read_todo_items() -> list[InvoiceRow]:
         if not doc1:
             continue  # skip blank rows
 
-        charge_hrs1 = _float_val(row, COL_CHARGE_HRS1)
-        charge_amt1 = _float_val(row, COL_AMOUNT1)
-        # Compute amount from hours if formula result not available
-        if charge_amt1 is None and charge_hrs1 is not None:
-            charge_amt1 = round(charge_hrs1 * HOURLY_RATE, 2)
-
-        charge_hrs2 = _float_val(row, COL_CHARGE_HRS2)
-        charge_amt2 = _float_val(row, COL_AMOUNT2)
-        if charge_amt2 is None and charge_hrs2 is not None:
-            charge_amt2 = round(charge_hrs2 * HOURLY_RATE, 2)
+        pause_val = _cell_val(row, COL_PAUSE)
+        is_paused = pause_val == "1" or (pause_val and pause_val.lower() == "true")
 
         item = InvoiceRow(
             sheet_row=i,
-            raw_values=row,
             document_1=doc1,
+            document_2=_cell_val(row, COL_DOC2),
             invoice=_cell_val(row, COL_INVOICE) or "",
             pod_filename=_cell_val(row, COL_POD_FILENAME) or "",
-            charge_hours_1=charge_hrs1,
-            charge_type_1=_cell_val(row, COL_CHARGE_TYPE1),
-            charge_amount_1=charge_amt1,
-            document_2=_cell_val(row, COL_DOC2),
-            charge_hours_2=charge_hrs2,
-            charge_type_2=_cell_val(row, COL_CHARGE_TYPE2),
-            charge_amount_2=charge_amt2,
+            charge_hours_1=_float_val(row, COL_CHARGE_HRS1),
+            charge_hours_2=_float_val(row, COL_CHARGE_HRS2),
+            pause=is_paused,
         )
         items.append(item)
 
-    log.info("Read %d items from To Do tab", len(items))
+    log.info("Read %d items from To Do tab (%d paused)",
+             len(items), sum(1 for x in items if x.pause))
     return items
 
 
-def move_to_status(item: InvoiceRow, status: str):
-    """Move a row from 'To Do' to 'Status' tab with timestamp and status.
+def move_to_status(item: InvoiceRow, status: str,
+                   processed_at_1: str = "", processed_at_2: str = "",
+                   pod_uploaded_1: str = "", pod_uploaded_2: str = ""):
+    """Move a row from 'To Do' to 'Status' tab with processing info.
 
-    1. Append the row to Status tab (with Processed_At and Status columns)
-    2. Delete the row from To Do tab
+    Status tab columns: A-F (same data) + G-K (processing info)
     """
     service = _get_sheets_service()
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # Reconstruct row from parsed fields to guarantee column alignment
-    # A: Document_1, B: Invoice, C: POD_Filename, D: Charge_Hrs_1,
-    # E: Charge_Type_1, F: Amount_1, G: (blank), H: Document_2,
-    # I: Charge_Hrs_2, J: Charge_Type_2, K: Amount_2,
-    # L: Processed_At, M: Status
+    # Build the row: A-F data + G-K processing info
     row_data = [
         item.document_1,
+        item.document_2 or "",
         item.invoice,
         item.pod_filename,
         item.charge_hours_1 if item.charge_hours_1 is not None else "",
-        item.charge_type_1 or "",
-        item.charge_amount_1 if item.charge_amount_1 is not None else "",
-        "",  # G: blank spacer
-        item.document_2 or "",
         item.charge_hours_2 if item.charge_hours_2 is not None else "",
-        item.charge_type_2 or "",
-        item.charge_amount_2 if item.charge_amount_2 is not None else "",
-        timestamp,  # L: Processed_At
-        status,     # M: Status
+        processed_at_1,     # G: Processed_At_1
+        processed_at_2,     # H: Processed_At_2
+        pod_uploaded_1,     # I: POD_Uploaded_1
+        pod_uploaded_2,     # J: POD_Uploaded_2
+        status,             # K: Status
     ]
 
-    # Append to Status tab
+    # Append to Status tab (no bold — use RAW input)
     service.spreadsheets().values().append(
         spreadsheetId=SHEET_ID,
-        range=f"'{STATUS_TAB}'!A:M",
+        range=f"'{STATUS_TAB}'!A:K",
         valueInputOption="RAW",
         insertDataOption="INSERT_ROWS",
         body={"values": [row_data]},
     ).execute()
 
+    # Apply color formatting to the new row
+    _apply_status_colors(service, status, pod_uploaded_1, pod_uploaded_2)
+
     # Delete the row from To Do tab
-    # Need the sheet's gid (sheetId) — get it from the spreadsheet metadata
+    _delete_todo_row(service, item.document_1)
+
+    log.info("Moved doc %s to Status tab: %s", item.document_1, status)
+
+
+def _apply_status_colors(service, status: str, pod1: str, pod2: str):
+    """Apply green (success) or red (error) font color to the last row in Status tab."""
+    try:
+        meta = service.spreadsheets().get(spreadsheetId=SHEET_ID).execute()
+        status_sheet_id = None
+        for sheet in meta.get("sheets", []):
+            if sheet["properties"]["title"] == STATUS_TAB:
+                status_sheet_id = sheet["properties"]["sheetId"]
+                break
+
+        if status_sheet_id is None:
+            return
+
+        # Get the row count to find the last row
+        result = service.spreadsheets().values().get(
+            spreadsheetId=SHEET_ID,
+            range=f"'{STATUS_TAB}'!A:A",
+        ).execute()
+        last_row = len(result.get("values", []))  # 1-based, includes header
+
+        if last_row < 2:
+            return
+
+        row_index = last_row - 1  # 0-based for batchUpdate
+
+        # Determine colors for each cell (G through K)
+        requests = []
+        cells_to_color = [
+            (6, True),                                          # G: Processed_At_1 — always green if filled
+            (7, True),                                          # H: Processed_At_2
+            (8, not pod1.startswith("error")),                  # I: POD_Uploaded_1
+            (9, not pod2.startswith("error")),                  # J: POD_Uploaded_2
+            (10, not status.startswith("error")),               # K: Status
+        ]
+
+        for col_index, is_success in cells_to_color:
+            color = {"red": 0.0, "green": 0.6, "blue": 0.0} if is_success else {"red": 0.8, "green": 0.0, "blue": 0.0}
+            requests.append({
+                "repeatCell": {
+                    "range": {
+                        "sheetId": status_sheet_id,
+                        "startRowIndex": row_index,
+                        "endRowIndex": row_index + 1,
+                        "startColumnIndex": col_index,
+                        "endColumnIndex": col_index + 1,
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "textFormat": {
+                                "foregroundColor": color,
+                                "bold": False,
+                            }
+                        }
+                    },
+                    "fields": "userEnteredFormat.textFormat",
+                }
+            })
+
+        if requests:
+            service.spreadsheets().batchUpdate(
+                spreadsheetId=SHEET_ID,
+                body={"requests": requests},
+            ).execute()
+
+    except Exception as e:
+        log.warning("Could not apply status colors: %s", e)
+
+
+def _delete_todo_row(service, document_1: str):
+    """Delete a row from To Do tab by matching Document_1."""
     try:
         meta = service.spreadsheets().get(spreadsheetId=SHEET_ID).execute()
         todo_sheet_id = None
@@ -218,25 +310,19 @@ def move_to_status(item: InvoiceRow, status: str):
                 todo_sheet_id = sheet["properties"]["sheetId"]
                 break
 
-        if todo_sheet_id is not None:
-            # Re-read current To Do to find the right row index
-            # (rows may have shifted if previous items were deleted)
-            current = service.spreadsheets().values().get(
-                spreadsheetId=SHEET_ID,
-                range=f"'{TODO_TAB}'!A:A",
-            ).execute()
-            current_rows = current.get("values", [])
+        if todo_sheet_id is None:
+            return
 
-            # Find the row with matching Document_1
-            delete_index = None
-            for idx, r in enumerate(current_rows):
-                if idx == 0:
-                    continue  # skip header
-                if r and str(r[0]).strip() == item.document_1:
-                    delete_index = idx
-                    break
+        current = service.spreadsheets().values().get(
+            spreadsheetId=SHEET_ID,
+            range=f"'{TODO_TAB}'!A:A",
+        ).execute()
+        current_rows = current.get("values", [])
 
-            if delete_index is not None:
+        for idx, r in enumerate(current_rows):
+            if idx == 0:
+                continue  # skip header
+            if r and str(r[0]).strip() == document_1:
                 service.spreadsheets().batchUpdate(
                     spreadsheetId=SHEET_ID,
                     body={"requests": [{
@@ -244,23 +330,114 @@ def move_to_status(item: InvoiceRow, status: str):
                             "range": {
                                 "sheetId": todo_sheet_id,
                                 "dimension": "ROWS",
-                                "startIndex": delete_index,
-                                "endIndex": delete_index + 1,
+                                "startIndex": idx,
+                                "endIndex": idx + 1,
                             }
                         }
                     }]},
                 ).execute()
-                log.info("Moved row %d (doc %s) to Status tab: %s",
-                         item.sheet_row, item.document_1, status)
-            else:
-                log.warning("Could not find row to delete for doc %s", item.document_1)
-        else:
-            log.warning("Could not find To Do sheet ID for row deletion")
+                log.info("Deleted row %d (doc %s) from To Do", idx, document_1)
+                return
+
+        log.warning("Could not find row to delete for doc %s", document_1)
     except Exception as e:
         log.error("Error deleting row from To Do: %s", e)
-        # Row was already appended to Status — not critical if delete fails
 
 
 def mark_error(item: InvoiceRow, error_msg: str):
     """Move an item to Status tab with an error message."""
-    move_to_status(item, f"error: {error_msg}")
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    move_to_status(item,
+                   status=f"error: {error_msg}",
+                   processed_at_1=timestamp)
+
+
+def _write_todo_status(document_1: str, status_text: str):
+    """Write a status value to column H of a row in To Do, matched by Document_1."""
+    service = _get_sheets_service()
+    try:
+        result = service.spreadsheets().values().get(
+            spreadsheetId=SHEET_ID,
+            range=f"'{TODO_TAB}'!A:A",
+        ).execute()
+        rows = result.get("values", [])
+
+        for idx, r in enumerate(rows):
+            if idx == 0:
+                continue
+            if r and str(r[0]).strip() == document_1:
+                # Write to column H of this row (1-based row = idx+1)
+                service.spreadsheets().values().update(
+                    spreadsheetId=SHEET_ID,
+                    range=f"'{TODO_TAB}'!H{idx + 1}",
+                    valueInputOption="RAW",
+                    body={"values": [[status_text]]},
+                ).execute()
+                log.info("Set To Do status for doc %s: '%s'", document_1, status_text)
+                return
+        log.warning("Could not find doc %s in To Do to update status", document_1)
+    except Exception as e:
+        log.error("Error writing To Do status: %s", e)
+
+
+def mark_tile3_done(item: InvoiceRow):
+    """Mark tile 3 (invoicing) as done — writes 'invoiced' to col H.
+
+    Row stays in To Do for tile 4 to process.
+    """
+    _write_todo_status(item.document_1, "invoiced")
+    log.info("Tile 3 done for doc %s — marked 'invoiced', stays in To Do for tile 4", item.document_1)
+
+
+def mark_tile3_paused(item: InvoiceRow):
+    """Mark tile 3 as paused — writes 'paused' to col H."""
+    _write_todo_status(item.document_1, "paused")
+
+
+def mark_fully_done(item: InvoiceRow, pod_uploaded_1: str = "done",
+                    pod_uploaded_2: str = "done"):
+    """Mark both tile 3 and tile 4 as done — move to Status tab."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    move_to_status(item,
+                   status="done",
+                   processed_at_1=timestamp,
+                   processed_at_2=timestamp,
+                   pod_uploaded_1=pod_uploaded_1,
+                   pod_uploaded_2=pod_uploaded_2)
+
+
+def sort_paused_rows_to_top():
+    """Sort To Do tab so paused rows (col G = 1) appear at the top."""
+    service = _get_sheets_service()
+    try:
+        meta = service.spreadsheets().get(spreadsheetId=SHEET_ID).execute()
+        todo_sheet_id = None
+        for sheet in meta.get("sheets", []):
+            if sheet["properties"]["title"] == TODO_TAB:
+                todo_sheet_id = sheet["properties"]["sheetId"]
+                break
+
+        if todo_sheet_id is None:
+            return
+
+        # Sort by column G (Pause) descending — 1s go to top
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=SHEET_ID,
+            body={"requests": [{
+                "sortRange": {
+                    "range": {
+                        "sheetId": todo_sheet_id,
+                        "startRowIndex": 1,  # skip header
+                        "startColumnIndex": 0,
+                        "endColumnIndex": 8,  # A through H
+                    },
+                    "sortSpecs": [{
+                        "dimensionIndex": COL_PAUSE,  # col G
+                        "sortOrder": "DESCENDING",
+                    }],
+                }
+            }]},
+        ).execute()
+        log.info("Sorted To Do: paused rows moved to top")
+    except Exception as e:
+        log.warning("Could not sort paused rows: %s", e)

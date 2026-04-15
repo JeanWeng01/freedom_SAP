@@ -103,11 +103,9 @@ def navigate_to_tile(driver: WebDriver):
     log.info("Tile 1 page loaded")
 
 
-def apply_status_filter_new(driver: WebDriver):
-    """Set the 'Freight Order Status' filter to 'New'."""
-    log.info("Applying Freight Order Status = 'New' filter")
-
-    js_find_filter = """
+def _find_status_filter_input(driver: WebDriver):
+    """Find the Freight Order Status filter input element via JS."""
+    return driver.execute_script("""
     var labels = document.querySelectorAll('label, span');
     for (var i = 0; i < labels.length; i++) {
         var clean = labels[i].textContent.replace(/\\xAD/g, '').trim();
@@ -130,31 +128,61 @@ def apply_status_filter_new(driver: WebDriver):
         }
     }
     return null;
-    """
+    """)
 
-    input_el = driver.execute_script(js_find_filter)
+
+def apply_status_filter(driver: WebDriver, status_value: str):
+    """Set the 'Freight Order Status' filter to the given value (e.g. 'New', 'Updated')."""
+    log.info("Applying Freight Order Status = '%s' filter", status_value)
+
+    # First, clear any existing filter tokens (e.g. leftover "New" from previous pass)
+    driver.execute_script("""
+        // Remove all token close buttons in the status filter (SAP multi-input tokens)
+        var tokens = document.querySelectorAll('.sapMToken .sapMTokenIcon, .sapMMultiInput .sapMTokenIcon');
+        for (var i = tokens.length - 1; i >= 0; i--) {
+            if (tokens[i].offsetParent !== null) tokens[i].click();
+        }
+    """)
+    _time.sleep(0.5)
+
+    input_el = _find_status_filter_input(driver)
 
     if input_el:
         log.info("Found Freight Order Status filter input")
         input_el.click()
         _time.sleep(0.5)
         input_el.clear()
-        input_el.send_keys("New")
-        _time.sleep(1)
-        take_screenshot(driver, "tile1_typed_new_in_filter")
+        input_el.send_keys(status_value)
+        _time.sleep(1.5)
+        take_screenshot(driver, f"tile1_typed_{status_value}_in_filter")
 
+        # Try to select from suggestion list
         try:
-            new_opt = wait_for_element(driver, By.XPATH,
-                "//li[.//span[text()='New'] or text()='New']"
-                " | //div[contains(@class,'sapMSLI')]//span[text()='New']/.."
-                " | //ul[contains(@class,'sapMList')]//span[text()='New']/..",
+            opt = wait_for_element(driver, By.XPATH,
+                f"//li[.//span[text()='{status_value}'] or text()='{status_value}']"
+                f" | //div[contains(@class,'sapMSLI')]//span[text()='{status_value}']/.."
+                f" | //ul[contains(@class,'sapMList')]//span[text()='{status_value}']/..",
                 timeout=5, clickable=True
             )
-            new_opt.click()
-            log.info("Selected 'New' from suggestion list")
+            opt.click()
+            log.info("Selected '%s' from suggestion list", status_value)
         except TimeoutException:
-            input_el.send_keys(Keys.RETURN)
-            log.info("Pressed Enter to apply 'New' filter")
+            # Try clicking matching option via JS (handles soft hyphens)
+            clicked = driver.execute_script("""
+                var target = arguments[0];
+                var items = document.querySelectorAll('li, [role="option"], [class*="sapMSLI"]');
+                for (var i = 0; i < items.length; i++) {
+                    if (items[i].offsetParent === null) continue;
+                    var t = items[i].textContent.replace(/\\xAD/g, '').trim();
+                    if (t === target) { items[i].click(); return true; }
+                }
+                return false;
+            """, status_value)
+            if clicked:
+                log.info("Selected '%s' via JS", status_value)
+            else:
+                input_el.send_keys(Keys.RETURN)
+                log.info("Pressed Enter to apply '%s' filter", status_value)
 
         wait_for_page_ready(driver)
     else:
@@ -170,7 +198,7 @@ def apply_status_filter_new(driver: WebDriver):
     except TimeoutException:
         log.info("No 'Go' button found — filter may have auto-applied")
 
-    take_screenshot(driver, "tile1_filter_applied")
+    take_screenshot(driver, f"tile1_filter_{status_value}_applied")
 
 
 def click_all_tab(driver: WebDriver):
@@ -187,7 +215,10 @@ def click_all_tab(driver: WebDriver):
 
 
 def get_expected_count(driver: WebDriver) -> int | None:
-    """Read the count from 'All Freight Orders (N)' label."""
+    """Read the count from 'All Freight Orders (N)' label.
+
+    Returns 0 if label shows 'All Freight Orders' without a count (no results).
+    """
     try:
         label = driver.find_element(*ORDER_COUNT_LABEL)
         text = label.text.replace('\xad', '').strip()
@@ -196,7 +227,9 @@ def get_expected_count(driver: WebDriver) -> int | None:
             count = int(match.group(1).replace(',', ''))
             log.info("Order count from label: %d ('%s')", count, text)
             return count
-        log.warning("Could not parse count from label: '%s'", text)
+        # Label says "All Freight Orders" without a number — means 0 results
+        log.info("No count in label '%s' — interpreting as 0", text)
+        return 0
     except NoSuchElementException:
         log.warning("Order count label not found")
     return None
@@ -279,113 +312,275 @@ def scroll_and_load_all(driver: WebDriver, expected_count: int | None):
 
 
 def click_select_all(driver: WebDriver) -> bool:
-    """Click the select-all checkbox in the table header.
+    """Select all items using SAP UI5's internal API, then also click the visual
+    checkbox to activate the Confirm button.
 
-    Uses JS to find the checkbox in the column header row — the first checkbox
-    that appears before any data rows.
+    Multiple strategies because SAP's checkbox is unreliable with Selenium.
     """
-    js_select_all = """
-    // Strategy 1: The header checkbox — first .sapMCb inside a column header or before list items
-    var headerCb = document.querySelector(
-        '.sapMListTblHeader .sapMCb, ' +
-        '.sapMListSelectAll .sapMCb, ' +
-        'thead .sapMCb, ' +
-        '.sapMListHdr .sapMCb'
-    );
-    if (headerCb) return headerCb;
+    from selenium.webdriver.common.action_chains import ActionChains
 
-    // Strategy 2: Find all checkboxes, pick the first one that's NOT inside a data row
-    var allCbs = document.querySelectorAll('.sapMCb');
-    for (var i = 0; i < allCbs.length; i++) {
-        var inDataRow = allCbs[i].closest('.sapMLIB, .sapMListItems, tbody tr');
-        if (!inDataRow) {
-            // This checkbox is outside data rows — likely the header
-            return allCbs[i];
-        }
-    }
+    # Strategy 1: Use SAP UI5 API to select all items programmatically
+    sap_selected = driver.execute_script("""
+        try {
+            // Find the SAP UI5 Table control
+            var tables = document.querySelectorAll('[class*="sapMList"], [class*="sapMTable"]');
+            for (var i = 0; i < tables.length; i++) {
+                if (tables[i].offsetParent === null) continue;
+                if (tables[i].id && window.sap && window.sap.ui && window.sap.ui.getCore) {
+                    var ctrl = sap.ui.getCore().byId(tables[i].id);
+                    if (ctrl && ctrl.selectAll) {
+                        ctrl.selectAll(true);
+                        return 'sap_selectAll';
+                    }
+                    if (ctrl && ctrl.getItems) {
+                        var items = ctrl.getItems();
+                        for (var j = 0; j < items.length; j++) {
+                            if (items[j].setSelected) items[j].setSelected(true);
+                        }
+                        ctrl.fireSelectionChange({selected: true, selectAll: true});
+                        return 'sap_setSelected_' + items.length;
+                    }
+                }
+            }
+        } catch(e) { return 'sap_error: ' + e.message; }
+        return null;
+    """)
+    if sap_selected:
+        log.info("SAP UI5 select all: %s", sap_selected)
 
-    // Strategy 3: Just get the very first checkbox on the page
-    return document.querySelector('.sapMCb');
-    """
+    # Strategy 2: Find and click the visual select-all checkbox
+    # Find it by its title="Select All" attribute
+    cb = driver.execute_script("""
+        // Look for element with title "Select All"
+        var el = document.querySelector('[title="Select All"], [aria-label="Select All"]');
+        if (el) return el;
+        // Fallback: header checkbox
+        var headerCb = document.querySelector(
+            '.sapMListTblHeader .sapMCb, .sapMListSelectAll .sapMCb'
+        );
+        return headerCb;
+    """)
 
-    cb = driver.execute_script(js_select_all)
     if cb:
-        try:
-            cb.click()
-            log.info("Clicked Select All checkbox (via JS)")
-            return True
-        except Exception as e:
-            log.warning("Click failed, trying JS click: %s", e)
-            driver.execute_script("arguments[0].click();", cb)
-            log.info("Clicked Select All checkbox (via JS .click())")
-            return True
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", cb)
+        _time.sleep(0.5)
 
-    log.error("Could not find Select All checkbox")
-    return False
+        # Double click: deselect then reselect to activate Confirm button
+        for click_num in range(2):
+            try:
+                ActionChains(driver).move_to_element(cb).click().perform()
+                log.info("Select All visual click %d (ActionChains)", click_num + 1)
+            except Exception:
+                try:
+                    cb.click()
+                    log.info("Select All visual click %d (native)", click_num + 1)
+                except Exception:
+                    driver.execute_script("arguments[0].click();", cb)
+                    log.info("Select All visual click %d (JS)", click_num + 1)
+            _time.sleep(1)
+    else:
+        log.warning("Select All checkbox not found — relying on SAP UI5 API")
+
+    # Verify: check if any rows are now selected
+    selected_count = driver.execute_script("""
+        var selected = document.querySelectorAll('.sapMLIBSelected, .sapMCbMarkChecked, [aria-selected="true"]');
+        return selected.length;
+    """)
+    log.info("Selected items count: %d", selected_count or 0)
+
+    return (selected_count or 0) > 0 or sap_selected is not None
 
 
 @destructive_action("Confirm all selected freight orders")
 def click_confirm(driver: WebDriver):
-    """Click the Confirm button."""
-    btn = wait_for_element(driver, *CONFIRM_BUTTON, timeout=15, clickable=True)
+    """Click the Confirm button (in the footer toolbar)."""
+    # Find Confirm button via JS — it's in the footer and may not be in viewport
+    btn = driver.execute_script("""
+        var btns = document.querySelectorAll('button');
+        for (var i = 0; i < btns.length; i++) {
+            var t = btns[i].textContent.replace(/\\xAD/g, '').trim();
+            if (t === 'Confirm') return btns[i];
+        }
+        return null;
+    """)
+    if not btn:
+        log.error("Confirm button not found on page")
+        take_screenshot(driver, "tile1_confirm_missing")
+        return
+
+    # Scroll it into view
+    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
+    _time.sleep(0.5)
     take_screenshot(driver, "tile1_before_confirm")
-    btn.click()
-    log.info("Clicked Confirm button")
-    wait_for_page_ready(driver)
+
+    from selenium.webdriver.common.action_chains import ActionChains
+    try:
+        btn.click()
+        log.info("Clicked Confirm button (native)")
+    except Exception:
+        try:
+            ActionChains(driver).move_to_element(btn).click().perform()
+            log.info("Clicked Confirm button (ActionChains)")
+        except Exception:
+            driver.execute_script("arguments[0].click();", btn)
+            log.info("Clicked Confirm button (JS)")
+
+    # SAP confirmation can take several minutes for large batches
+    # Wait up to 3 minutes for the page to finish processing
+    log.info("Waiting for confirmation to process (may take a few minutes)...")
+    from selenium.webdriver.support.ui import WebDriverWait
+    try:
+        # First wait for busy indicator to APPEAR (confirms SAP started processing)
+        WebDriverWait(driver, 10).until(
+            lambda d: d.execute_script("""
+                var busy = document.querySelectorAll(
+                    '.sapUiLocalBusyIndicator, .sapMBusyDialog, .sapUiBLy, .sapMBusyIndicator'
+                );
+                for (var i = 0; i < busy.length; i++) {
+                    if (busy[i].offsetParent !== null) return true;
+                }
+                return false;
+            """)
+        )
+        log.info("SAP processing started (busy indicator appeared)")
+    except Exception:
+        log.info("No busy indicator appeared — SAP may have processed instantly")
+
+    # Then wait for it to DISAPPEAR (up to 3 minutes)
+    try:
+        WebDriverWait(driver, 180).until(
+            lambda d: d.execute_script("""
+                var busy = document.querySelectorAll(
+                    '.sapUiLocalBusyIndicator, .sapMBusyDialog, .sapUiBLy, .sapMBusyIndicator'
+                );
+                for (var i = 0; i < busy.length; i++) {
+                    if (busy[i].offsetParent !== null &&
+                        busy[i].style.visibility !== 'hidden' &&
+                        busy[i].style.display !== 'none') return false;
+                }
+                return true;
+            """)
+        )
+        log.info("SAP processing complete (busy indicator gone)")
+    except Exception:
+        log.warning("Busy indicator still present after 3 minutes — proceeding anyway")
+
+    _time.sleep(2)
     take_screenshot(driver, "tile1_after_confirm")
 
 
+def confirm_filtered_orders(driver: WebDriver, status_value: str,
+                            *, dry_run: bool = False) -> int:
+    """Filter by status, select all, confirm. Loops until count drops to 0.
+
+    Exits if: count reaches 0, count doesn't decrease (stuck), or max passes reached.
+    """
+    log.info("── Confirming '%s' orders ──", status_value)
+    total = 0
+    max_passes = 10
+    prev_expected = None
+
+    for pass_num in range(1, max_passes + 1):
+        log.info("'%s' pass %d", status_value, pass_num)
+
+        apply_status_filter(driver, status_value)
+        click_all_tab(driver)
+
+        expected = get_expected_count(driver)
+
+        if expected == 0:
+            log.info("No '%s' freight orders remaining — done", status_value)
+            break
+
+        if expected is None:
+            log.warning("Could not determine order count — proceeding cautiously")
+
+        # Safety: if count didn't decrease from last pass, stop (avoid infinite loop)
+        if prev_expected is not None and expected is not None and expected >= prev_expected:
+            log.warning("Count did not decrease (%s → %s) — stopping to avoid loop",
+                        prev_expected, expected)
+            break
+        prev_expected = expected
+
+        loaded = scroll_and_load_all(driver, expected)
+        take_screenshot(driver, f"tile1_loaded_{loaded}_{status_value}_pass{pass_num}")
+
+        if loaded == 0:
+            log.info("No rows loaded for '%s' — done", status_value)
+            break
+
+        log.info("Loaded %d '%s' rows — selecting all", loaded, status_value)
+
+        driver.execute_script("window.scrollTo(0, 0);")
+        _time.sleep(1)
+
+        if click_select_all(driver):
+            wait_for_page_ready(driver)
+            take_screenshot(driver, f"tile1_selected_{status_value}_pass{pass_num}")
+        else:
+            take_screenshot(driver, f"tile1_select_failed_{status_value}")
+            break
+
+        click_confirm(driver, dry_run=dry_run)
+        total += loaded
+
+        if dry_run:
+            log.info("[DRY RUN] Would have confirmed %d '%s' orders", loaded, status_value)
+            break
+
+        # Refresh page for next pass
+        log.info("Refreshing to check for remaining '%s' orders", status_value)
+        driver.refresh()
+        _time.sleep(3)
+        try:
+            wait_for_page_ready(driver)
+        except Exception:
+            _time.sleep(3)
+
+    log.info("Total '%s' confirmed: %d %s",
+             status_value, total, "(dry run)" if dry_run else "")
+    return total
+
+
+def clear_status_filter(driver: WebDriver):
+    """Clear any existing filter tokens from the Freight Order Status field."""
+    driver.execute_script("""
+        // Remove all token close buttons
+        var tokens = document.querySelectorAll('.sapMToken .sapMTokenIcon, .sapMMultiInput .sapMTokenIcon');
+        for (var i = tokens.length - 1; i >= 0; i--) {
+            if (tokens[i].offsetParent !== null) tokens[i].click();
+        }
+    """)
+    _time.sleep(0.5)
+
+    # Also clear the input field text
+    input_el = _find_status_filter_input(driver)
+    if input_el:
+        input_el.click()
+        input_el.clear()
+        _time.sleep(0.3)
+
+    log.info("Cleared status filter")
+    wait_for_page_ready(driver)
+
+
 def run(driver: WebDriver, *, dry_run: bool = False, **_kwargs):
-    """Execute the full Tile 1 workflow."""
+    """Execute the full Tile 1 workflow — confirm both 'New' and 'Updated' orders.
+
+    Returns dict with per-status counts: {"new": N, "updated": M, "total": N+M}
+    """
     navigate_to_tile(driver)
 
-    # Step 1: Apply "Freight Order Status = New" filter
-    apply_status_filter_new(driver)
+    counts = {}
+    for status in ["New", "Updated"]:
+        counts[status.lower()] = confirm_filtered_orders(driver, status, dry_run=dry_run)
 
-    # Step 2: Click "All" tab to see all filtered results
-    click_all_tab(driver)
+        # Clear the filter before applying the next one
+        log.info("Clearing filter before next status")
+        clear_status_filter(driver)
 
-    # Read expected count
-    expected = get_expected_count(driver)
-
-    if expected == 0:
-        log.info("No 'New' freight orders to confirm — done")
-        take_screenshot(driver, "tile1_zero_new")
-        return 0
-
-    if expected is None:
-        log.warning("Could not determine order count — proceeding cautiously")
-
-    # Step 3: Scroll to load ALL items
-    loaded = scroll_and_load_all(driver, expected)
-    take_screenshot(driver, f"tile1_loaded_{loaded}_rows")
-
-    if loaded == 0:
-        log.info("No rows loaded — nothing to confirm")
-        return 0
-
-    log.info("Loaded %d rows (expected %s) — selecting all", loaded, expected)
-
-    # Step 4: Scroll back to top before clicking select-all (header must be visible)
-    driver.execute_script("window.scrollTo(0, 0);")
-    _time.sleep(1)
-
-    # Step 5: Select all
-    if click_select_all(driver):
-        wait_for_page_ready(driver)
-        take_screenshot(driver, "tile1_all_selected")
-    else:
-        take_screenshot(driver, "tile1_select_all_failed")
-        return 0
-
-    # Step 6: Confirm
-    click_confirm(driver, dry_run=dry_run)
-
-    if dry_run:
-        log.info("[DRY RUN] Would have confirmed %d orders (label said %s)",
-                 loaded, expected)
-        take_screenshot(driver, "tile1_dry_run_done")
-
-    log.info("Tile 1 complete — %d orders %s",
-             loaded, "would be confirmed (dry run)" if dry_run else "confirmed")
-    return loaded
+    total = sum(counts.values())
+    log.info("Tile 1 complete — New: %d, Updated: %d, Total: %d %s",
+             counts["new"], counts["updated"], total,
+             "(dry run)" if dry_run else "")
+    return {"new": counts["new"], "updated": counts["updated"], "total": total}

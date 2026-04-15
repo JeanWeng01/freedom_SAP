@@ -18,7 +18,10 @@ from bot.utils import (
     wait_for_element, wait_for_page_ready, take_screenshot,
     destructive_action, click_tile,
 )
-from bot.google_sheets import InvoiceRow, read_todo_items, move_to_status, mark_error
+from bot.google_sheets import (
+    InvoiceRow, read_todo_items, mark_tile3_done, mark_tile3_paused,
+    mark_error, sort_paused_rows_to_top,
+)
 
 log = logging.getLogger(__name__)
 
@@ -273,22 +276,39 @@ def enter_invoice_number(driver: WebDriver, invoice_num: str):
 
 def add_charge(driver: WebDriver, charge_type: str, amount: float):
     """Add a charge in the Charges tab."""
-    # Click Charges tab
-    driver.execute_script("""
-        var spans = document.querySelectorAll('span');
+    # Find the Charges tab element
+    charges_tab = driver.execute_script("""
+        var spans = document.querySelectorAll('span, div');
         for (var i = 0; i < spans.length; i++) {
             if (spans[i].offsetParent === null) continue;
             var t = spans[i].textContent.replace(/\\xAD/g, '').trim();
             if (t === 'Charges') {
                 var tab = spans[i].closest('[role="tab"], [class*="sapMITBFilter"], [class*="sapMITBItem"]');
-                if (tab) { tab.click(); return; }
-                spans[i].click();
-                return;
+                if (tab) return tab;
+                return spans[i];
             }
         }
+        return null;
     """)
-    _time.sleep(1)
+
+    if not charges_tab:
+        log.error("Charges tab not found")
+        take_screenshot(driver, "tile3_charges_tab_missing")
+        return
+
+    # Native click on Charges tab
+    try:
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", charges_tab)
+        _time.sleep(0.3)
+        charges_tab.click()
+        log.info("Clicked Charges tab (native)")
+    except Exception:
+        ActionChains(driver).move_to_element(charges_tab).click().perform()
+        log.info("Clicked Charges tab (ActionChains)")
+
+    _time.sleep(2)
     wait_for_page_ready(driver)
+    take_screenshot(driver, f"tile3_charges_tab_open_{charge_type[:15]}")
 
     # Click Add button
     add_btn = driver.execute_script("""
@@ -302,6 +322,8 @@ def add_charge(driver: WebDriver, charge_type: str, amount: float):
     """)
     if add_btn:
         try:
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", add_btn)
+            _time.sleep(0.3)
             add_btn.click()
         except Exception:
             ActionChains(driver).move_to_element(add_btn).click().perform()
@@ -401,6 +423,33 @@ def click_submit(driver: WebDriver, *, invoice_num: str = ""):
         take_screenshot(driver, "tile3_submit_missing")
 
 
+def click_save(driver: WebDriver, invoice_num: str = ""):
+    """Click the Save button (next to Submit) for paused items."""
+    take_screenshot(driver, f"tile3_before_save_{invoice_num}")
+    btn = driver.execute_script("""
+        var btns = document.querySelectorAll('button');
+        for (var i = 0; i < btns.length; i++) {
+            if (btns[i].offsetParent === null) continue;
+            var t = btns[i].textContent.replace(/\\xAD/g, '').trim();
+            if (t === 'Save') return btns[i];
+        }
+        return null;
+    """)
+    if btn:
+        try:
+            btn.click()
+        except Exception:
+            ActionChains(driver).move_to_element(btn).click().perform()
+        log.info("Clicked Save for invoice %s (paused item)", invoice_num)
+        _time.sleep(2)
+        wait_for_page_ready(driver)
+        dismiss_any_popup(driver)
+        take_screenshot(driver, f"tile3_after_save_{invoice_num}")
+    else:
+        log.error("Save button not found")
+        take_screenshot(driver, "tile3_save_missing")
+
+
 def click_back(driver: WebDriver):
     """Navigate back with fallbacks."""
     wait_for_page_ready(driver)
@@ -423,7 +472,7 @@ def click_back(driver: WebDriver):
 
 def fill_invoice_and_submit(driver: WebDriver, row: InvoiceRow,
                             *, dry_run: bool = False, step_through: bool = False) -> str:
-    """Fill invoice number, add charges, and submit. Called when invoice page is open."""
+    """Fill invoice number, add charges, and submit (or save if paused)."""
     enter_invoice_number(driver, row.invoice)
 
     if row.has_charges_leg1:
@@ -431,6 +480,12 @@ def fill_invoice_and_submit(driver: WebDriver, row: InvoiceRow,
 
     if row.is_collective and row.has_charges_leg2:
         add_charge(driver, row.charge_type_2, row.charge_amount_2)
+
+    if row.pause:
+        # Paused: Save instead of Submit — human will review and submit manually
+        click_save(driver, invoice_num=row.invoice)
+        click_back(driver)
+        return "paused"
 
     click_submit(driver, invoice_num=row.invoice, dry_run=dry_run, step_through=step_through)
 
@@ -704,7 +759,12 @@ def process_row(driver: WebDriver, row: InvoiceRow,
 
 
 def run(driver: WebDriver, *, dry_run: bool = False, step_through: bool = False, **_kwargs):
-    """Execute the full Tile 3 workflow using Google Sheets."""
+    """Execute the full Tile 3 workflow using Google Sheets.
+
+    Paused items (Pause=1): create invoice, fill details, Save (not Submit), keep in To Do.
+    Non-paused items: create invoice, fill details, Submit, keep in To Do for tile 4.
+    Items only move to Status tab after both tile 3 and tile 4 complete.
+    """
     import os
     launchpad_url = os.environ.get("SAP_LAUNCHPAD_URL", "")
 
@@ -713,24 +773,42 @@ def run(driver: WebDriver, *, dry_run: bool = False, step_through: bool = False,
         log.info("No items in To Do tab — nothing to invoice")
         return {"submitted": 0, "errors": 0}
 
-    log.info("Found %d items in To Do tab", len(rows))
-    results = {"submitted": 0, "drafted": 0, "skipped": 0, "errors": 0}
+    # Process non-paused items first, then paused items stay in To Do
+    active_rows = [r for r in rows if not r.pause]
+    paused_rows = [r for r in rows if r.pause]
+
+    log.info("Found %d items: %d active, %d paused",
+             len(rows), len(active_rows), len(paused_rows))
+
+    results = {"submitted": 0, "paused": 0, "drafted": 0, "skipped": 0, "errors": 0}
+
+    if not active_rows and not paused_rows:
+        log.info("No items to process")
+        return results
 
     navigate_to_tile(driver)
 
-    for i, row in enumerate(rows):
-        log.info("════ Invoice %d/%d (doc %s) ════", i + 1, len(rows), row.document_1)
+    # Process all items (active first, then paused)
+    all_to_process = active_rows + paused_rows
+
+    for i, row in enumerate(all_to_process):
+        pause_label = " [PAUSED]" if row.pause else ""
+        log.info("════ Invoice %d/%d (doc %s)%s ════",
+                 i + 1, len(all_to_process), row.document_1, pause_label)
 
         status = process_row(driver, row, dry_run=dry_run, step_through=step_through)
         log.info("Result: %s", status)
 
         if status == "submitted":
             results["submitted"] += 1
-            move_to_status(row, "done")
+            mark_tile3_done(row)  # stays in To Do for tile 4
+        elif status == "paused":
+            results["paused"] += 1
+            mark_tile3_paused(row)
+            log.info("Paused item saved — marked 'paused' in To Do for human review")
         elif status == "dry_run":
             results["skipped"] += 1
         elif status == "drafted":
-            # Invoice went to Drafts — recover it from Manage Invoices
             log.info("Attempting to recover drafted invoice for %s", row.document_1)
             draft_status = process_drafted_invoice(driver, row,
                                                     dry_run=dry_run, step_through=step_through)
@@ -738,7 +816,9 @@ def run(driver: WebDriver, *, dry_run: bool = False, step_through: bool = False,
 
             if draft_status == "submitted":
                 results["submitted"] += 1
-                move_to_status(row, "done (recovered from drafts)")
+                mark_tile3_done(row)
+            elif draft_status == "paused":
+                results["paused"] += 1
             elif draft_status == "dry_run":
                 results["skipped"] += 1
             else:
@@ -749,11 +829,14 @@ def run(driver: WebDriver, *, dry_run: bool = False, step_through: bool = False,
             mark_error(row, status.replace("error: ", ""))
 
         # Navigate back to Invoice Freight Documents tile for next item
-        if i < len(rows) - 1:
+        if i < len(all_to_process) - 1:
             if launchpad_url:
                 driver.get(launchpad_url)
                 wait_for_page_ready(driver)
             navigate_to_tile(driver)
+
+    # Sort paused rows to top of To Do for easy human access
+    sort_paused_rows_to_top()
 
     log.info("Tile 3 complete: %s", results)
     return results

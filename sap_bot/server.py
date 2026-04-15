@@ -101,11 +101,13 @@ def run_tile(tile_num: int, dry_run: bool = False) -> dict:
             return result
 
         if tile_num == 1:
-            count = tile1_confirmation.run(driver, dry_run=dry_run)
+            counts = tile1_confirmation.run(driver, dry_run=dry_run)
             result = {
                 "status": "completed",
                 "tile": 1,
-                "orders_confirmed": count,
+                "new_confirmed": counts.get("new", 0),
+                "updated_confirmed": counts.get("updated", 0),
+                "total_confirmed": counts.get("total", 0),
                 "dry_run": dry_run,
                 "started": start_time,
                 "finished": datetime.now().isoformat(),
@@ -230,8 +232,22 @@ def is_in_invoice_window() -> bool:
 
 # ── Auto-schedulers (background threads) ────────────────────────────────────
 
-# Tiles 1 & 2 run times (ET): 9am, 12pm, 3pm
-TILE12_RUN_HOURS = [int(h) for h in os.environ.get("TILE12_RUN_HOURS", "9,12,15").split(",")]
+# Tiles 1 & 2 run times (ET) as HH:MM. Examples: "9:00,12:30,15:00" or "9,12,15" (hours only)
+def _parse_run_times(spec: str) -> list[tuple[int, int]]:
+    """Parse run times spec like '9:00,12:30,15:00' or '9,12,15' into [(hr, min), ...]."""
+    times = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" in part:
+            h, m = part.split(":", 1)
+            times.append((int(h), int(m)))
+        else:
+            times.append((int(part), 0))
+    return sorted(times)
+
+TILE12_RUN_TIMES = _parse_run_times(os.environ.get("TILE12_RUN_HOURS", "9:00,12:00,15:00"))
 
 # Tiles 3 & 4: disabled by default, enable via env var ENABLE_TILES_34=true
 TILES_34_ENABLED = os.environ.get("ENABLE_TILES_34", "false").lower() == "true"
@@ -239,34 +255,40 @@ TILE34_INTERVAL_MINUTES = int(os.environ.get("TILE34_INTERVAL_MINUTES", "180"))
 
 
 def scheduler_loop_12():
-    """Run tiles 1 & 2 at specific hours (default: 9am, 12pm, 3pm ET)."""
+    """Run tiles 1 & 2 at specific HH:MM times (default: 9:00, 12:00, 15:00 ET)."""
     import time
-    log.info("Tiles 1 & 2 scheduler started — runs at hours: %s", TILE12_RUN_HOURS)
+    times_str = ", ".join(f"{h:02d}:{m:02d}" for h, m in TILE12_RUN_TIMES)
+    log.info("Tiles 1 & 2 scheduler started — runs at: %s", times_str)
 
-    already_ran_this_hour = None
+    already_ran = None  # (year, month, day, hour, minute) of last run to avoid double-fire
 
     while True:
         now = datetime.now()
-        current_hour = now.hour
+        current_key = (now.year, now.month, now.day, now.hour, now.minute)
 
-        if current_hour in TILE12_RUN_HOURS and already_ran_this_hour != current_hour:
-            already_ran_this_hour = current_hour
-            try:
-                run_auto_cycle_12()
-            except Exception as e:
-                log.error("Tiles 1 & 2 auto cycle error: %s", e, exc_info=True)
+        # Check if current (hour, minute) matches any run time
+        for hr, mn in TILE12_RUN_TIMES:
+            if now.hour == hr and now.minute == mn and already_ran != current_key:
+                already_ran = current_key
+                try:
+                    run_auto_cycle_12()
+                except Exception as e:
+                    log.error("Tiles 1 & 2 auto cycle error: %s", e, exc_info=True)
 
-            # Update next run time
-            remaining_hours = [h for h in TILE12_RUN_HOURS if h > current_hour]
-            if remaining_hours:
-                next_hour = remaining_hours[0]
-                next_run = now.replace(hour=next_hour, minute=0, second=0).isoformat()
-            else:
-                next_run = f"tomorrow at {TILE12_RUN_HOURS[0]}:00"
-            run_status["next_auto_run"] = next_run
-            log.info("Next tiles 1 & 2 run: %s", next_run)
+                # Compute next run time
+                remaining = [(h, m) for h, m in TILE12_RUN_TIMES
+                             if (h, m) > (now.hour, now.minute)]
+                if remaining:
+                    nh, nm = remaining[0]
+                    next_run = now.replace(hour=nh, minute=nm, second=0, microsecond=0).isoformat()
+                else:
+                    nh, nm = TILE12_RUN_TIMES[0]
+                    next_run = f"tomorrow at {nh:02d}:{nm:02d}"
+                run_status["next_auto_run"] = next_run
+                log.info("Next tiles 1 & 2 run: %s", next_run)
+                break
 
-        time.sleep(60)  # check every minute
+        time.sleep(30)  # check every 30 seconds
 
 
 def scheduler_loop_34():
