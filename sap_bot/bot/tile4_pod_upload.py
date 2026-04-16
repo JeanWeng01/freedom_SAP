@@ -479,32 +479,35 @@ def upload_and_report(driver: WebDriver, local_paths: list, *, doc_number: str =
         take_screenshot(driver, f"tile4_no_file_input_{doc_number}")
         return False
 
-    # Try sending all files at once (newline-joined paths for multi-file input)
-    uploaded = 0
-    for path in local_paths:
-        try:
-            # Re-find file input each iteration in case popup updated
-            fi = driver.execute_script("""
-                return document.querySelector('input[type="file"]');
-            """)
-            if fi:
-                fi.send_keys(path)
-                log.info("Uploaded file %d/%d: %s",
-                         uploaded + 1, len(local_paths), os.path.basename(path))
-                uploaded += 1
-                _time.sleep(2)
-                wait_for_page_ready(driver)
-            else:
-                log.warning("File input disappeared after upload %d", uploaded)
-                break
-        except Exception as e:
-            log.error("Error uploading %s: %s", os.path.basename(path), e)
+    # SAP's Browse dialog requires ALL files selected at once (Ctrl+click multi-select).
+    # Sequential uploads REPLACE the previous one — only the last file sticks.
+    # In Selenium, send_keys with newline-joined paths selects multiple files in one action.
+    try:
+        # Make the file input visible/interactable via JS (some SAP dialogs hide it)
+        driver.execute_script("""
+            var fi = document.querySelector('input[type="file"]');
+            if (fi) {
+                fi.style.display = 'block';
+                fi.style.visibility = 'visible';
+                fi.style.opacity = '1';
+                fi.removeAttribute('hidden');
+            }
+        """)
+        _time.sleep(0.3)
 
-    if uploaded == 0:
-        log.error("No files were uploaded")
+        file_input = driver.find_element(By.CSS_SELECTOR, 'input[type="file"]')
+
+        # Pass all paths as newline-separated string — Selenium sends them as one selection
+        all_paths = "\n".join(local_paths)
+        file_input.send_keys(all_paths)
+        log.info("Uploaded %d files in one action: %s",
+                 len(local_paths),
+                 ", ".join(os.path.basename(p) for p in local_paths))
+        _time.sleep(2)
+        wait_for_page_ready(driver)
+    except Exception as e:
+        log.error("Multi-file upload failed: %s", e)
         return False
-
-    log.info("Uploaded %d/%d files", uploaded, len(local_paths))
 
     take_screenshot(driver, f"tile4_filled_popup_{doc_number}")
 
@@ -674,9 +677,9 @@ def run(driver: WebDriver, *, dry_run: bool = False, **_kwargs):
         if download_errors:
             missing = ", ".join(download_errors)
             log.error("Missing PDFs in Drive: %s", missing)
-            mark_error(row, f"PDFs not found in Google Drive: {missing}")
+            # Don't move to Status — this might be temporary (file not uploaded yet)
+            _write_todo_status(row.document_1, f"pod_error: PDFs not in Drive: {missing[:40]}")
             results["errors"] += 1
-            # Clean up any that were downloaded
             for p in local_paths:
                 cleanup_temp_file(p)
             continue

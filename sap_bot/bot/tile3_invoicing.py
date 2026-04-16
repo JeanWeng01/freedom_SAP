@@ -187,22 +187,40 @@ def click_all_tab_tile3(driver: WebDriver):
 
     The tabs are in an icon tab bar. The 'All' tab label looks like 'All (2)'.
     """
-    # Only find tabs that are specifically tab roles (not random spans)
-    all_tab = driver.execute_script("""
-        // Look specifically in tab filter elements
-        var tabs = document.querySelectorAll('[role="tab"], .sapMITBFilter, .sapMITBItem');
+    # Wait for the page to settle and tab content to render (esp. important in headless)
+    _time.sleep(2)
+    wait_for_page_ready(driver)
+
+    # Find the All tab — try a few times since headless rendering can be slow
+    from selenium.webdriver.support.ui import WebDriverWait
+    all_tab = None
+    js_finder = """
+        // Search ANY element (don't restrict to offsetParent — headless can be weird)
+        var tabs = document.querySelectorAll('[role="tab"], .sapMITBFilter, .sapMITBItem, span, div');
         for (var i = 0; i < tabs.length; i++) {
-            if (tabs[i].offsetParent === null) continue;
-            var t = tabs[i].textContent.replace(/\\xAD/g, '').trim();
-            // Match "All" or "All (N)" at start — e.g. "All (2)" or "All(2)" or "All 2"
-            if (/^All\\b/.test(t) && t.length < 20) {
+            var t = tabs[i].textContent.replace(/\\xAD/g, '').replace(/\\s+/g, ' ').trim();
+            if (/^All\\s*\\(\\d+\\)$/.test(t) || /^All\\s*\\(\\d/.test(t)) {
+                // Prefer a clickable parent (tab role or ITB element)
+                var clickable = tabs[i].closest('[role="tab"], [class*="sapMITB"]');
+                return clickable || tabs[i];
+            }
+            if (t === 'All' && (tabs[i].getAttribute('role') === 'tab' ||
+                                 tabs[i].className.indexOf('sapMITB') !== -1)) {
                 return tabs[i];
             }
         }
         return null;
-    """)
+    """
+    try:
+        all_tab = WebDriverWait(driver, 15).until(
+            lambda d: d.execute_script(js_finder)
+        )
+    except Exception:
+        pass
+
     if not all_tab:
-        log.warning("'All' tab not found")
+        log.warning("'All' tab not found after waiting")
+        take_screenshot(driver, "tile3_all_tab_not_found")
         return False
 
     # Native click — JS click doesn't trigger SAP UI5 tab switch
@@ -1285,10 +1303,16 @@ def run(driver: WebDriver, *, dry_run: bool = False, step_through: bool = False,
                 results["skipped"] += 1
             else:
                 results["errors"] += 1
-                mark_error(row, draft_status.replace("error: ", ""))
+                # Don't move to Status — leave in To Do with error in col H so it retries next cycle
+                from bot.google_sheets import _write_todo_status
+                _write_todo_status(row.document_1,
+                                   f"tile3_error: {draft_status.replace('error: ', '')[:60]}")
         elif status.startswith("error:"):
             results["errors"] += 1
-            mark_error(row, status.replace("error: ", ""))
+            # Don't move to Status — leave in To Do for retry
+            from bot.google_sheets import _write_todo_status
+            _write_todo_status(row.document_1,
+                               f"tile3_error: {status.replace('error: ', '')[:60]}")
 
         # Navigate back to Invoice Freight Documents tile for next item
         if i < len(all_to_process) - 1:

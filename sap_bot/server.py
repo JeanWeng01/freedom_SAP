@@ -463,10 +463,9 @@ if __name__ == "__main__":
     t12.start()
     log.info("Tiles 1 & 2 scheduler started")
 
-    # Start tiles 3 & 4 scheduler (4am-9am window)
+    # Start tiles 3 & 4 scheduler (disabled unless ENABLE_TILES_34=true)
     t34 = threading.Thread(target=scheduler_loop_34, daemon=True)
     t34.start()
-    log.info("Tiles 3 & 4 scheduler started (4am-9am window)")
 
     # Start Flask
     port = int(os.environ.get("PORT", 8080))
