@@ -381,12 +381,15 @@ def _write_todo_status(document_1: str, status_text: str):
 
 
 def mark_tile3_done(item: InvoiceRow):
-    """Mark tile 3 (invoicing) as done — writes 'invoiced' to col H.
-
-    Row stays in To Do for tile 4 to process.
-    """
+    """Mark tile 3 (invoicing) as done — writes 'invoiced' to col H."""
     _write_todo_status(item.document_1, "invoiced")
     log.info("Tile 3 done for doc %s — marked 'invoiced', stays in To Do for tile 4", item.document_1)
+
+
+def mark_tile3_done_with_note(item: InvoiceRow, note: str):
+    """Mark tile 3 as done but with a note (e.g. one leg skipped)."""
+    _write_todo_status(item.document_1, f"invoiced ({note})")
+    log.info("Tile 3 done for doc %s with note: %s", item.document_1, note)
 
 
 def mark_tile3_paused(item: InvoiceRow):

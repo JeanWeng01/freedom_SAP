@@ -19,8 +19,8 @@ from bot.utils import (
     destructive_action, click_tile,
 )
 from bot.google_sheets import (
-    InvoiceRow, read_todo_items, mark_tile3_done, mark_tile3_paused,
-    mark_error, sort_paused_rows_to_top,
+    InvoiceRow, read_todo_items, mark_tile3_done, mark_tile3_done_with_note,
+    mark_tile3_paused, mark_error, sort_paused_rows_to_top,
 )
 
 log = logging.getLogger(__name__)
@@ -167,6 +167,152 @@ def filter_collective_documents(driver: WebDriver, doc1: str, doc2: str):
     wait_for_page_ready(driver)
 
 
+def count_visible_rows(driver: WebDriver) -> int:
+    """Count visible data rows in the current table view."""
+    return driver.execute_script("""
+        var rows = document.querySelectorAll('.sapMListItems .sapMLIB, .sapMListTblRow');
+        var n = 0;
+        for (var i = 0; i < rows.length; i++) {
+            if (rows[i].offsetParent === null) continue;
+            if (rows[i].classList.contains('sapMListTblHeader')) continue;
+            if (rows[i].textContent.trim().length > 0) n++;
+        }
+        return n;
+    """) or 0
+
+
+def click_all_tab_tile3(driver: WebDriver):
+    """Click the 'All (X)' tab to show filter results regardless of invoicing status.
+
+    The tabs are in an icon tab bar. The 'All' tab label looks like 'All (2)'.
+    """
+    # Only find tabs that are specifically tab roles (not random spans)
+    all_tab = driver.execute_script("""
+        // Look specifically in tab filter elements
+        var tabs = document.querySelectorAll('[role="tab"], .sapMITBFilter, .sapMITBItem');
+        for (var i = 0; i < tabs.length; i++) {
+            if (tabs[i].offsetParent === null) continue;
+            var t = tabs[i].textContent.replace(/\\xAD/g, '').trim();
+            // Match "All" or "All (N)" at start — e.g. "All (2)" or "All(2)" or "All 2"
+            if (/^All\\b/.test(t) && t.length < 20) {
+                return tabs[i];
+            }
+        }
+        return null;
+    """)
+    if not all_tab:
+        log.warning("'All' tab not found")
+        return False
+
+    # Native click — JS click doesn't trigger SAP UI5 tab switch
+    try:
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", all_tab)
+        _time.sleep(0.3)
+        all_tab.click()
+        log.info("Clicked 'All' tab (native)")
+    except Exception:
+        try:
+            ActionChains(driver).move_to_element(all_tab).click().perform()
+            log.info("Clicked 'All' tab (ActionChains)")
+        except Exception as e:
+            log.error("Could not click All tab: %s", e)
+            return False
+
+    _time.sleep(2)
+    wait_for_page_ready(driver)
+    return True
+
+
+def read_row_doc_and_status(driver: WebDriver) -> list[dict]:
+    """Read each visible row's freight document number and Invoicing Status."""
+    rows_info = driver.execute_script("""
+        var results = [];
+        var rows = document.querySelectorAll('.sapMListItems .sapMLIB, .sapMListTblRow');
+        for (var i = 0; i < rows.length; i++) {
+            if (rows[i].offsetParent === null) continue;
+            if (rows[i].classList.contains('sapMListTblHeader')) continue;
+            var text = rows[i].textContent.replace(/\\xAD/g, '').trim();
+            if (text.length === 0) continue;
+
+            // Find all long digit strings in the row — pick any 10-digit number
+            // (freight doc numbers are typically 10 digits like 6100184538)
+            var doc = null;
+            var digitMatches = text.match(/\\d{10}/g);
+            if (digitMatches) {
+                // Prefer digits starting with 61 (freight doc prefix)
+                for (var j = 0; j < digitMatches.length; j++) {
+                    if (digitMatches[j].substring(0, 2) === '61') {
+                        doc = digitMatches[j];
+                        break;
+                    }
+                }
+                if (!doc) doc = digitMatches[0];  // fallback to first 10-digit match
+            }
+
+            // Fallback: scan for 8-12 digit strings
+            if (!doc) {
+                var m = text.match(/\\d{8,12}/);
+                if (m) doc = m[0];
+            }
+
+            // Find Invoicing Status — case-insensitive
+            var tLower = text.toLowerCase();
+            var status = '';
+            if (tLower.indexOf('completely invoiced') !== -1) status = 'Completely invoiced';
+            else if (tLower.indexOf('invoicing in process') !== -1) status = 'Invoicing in process';
+            else if (tLower.indexOf('not yet invoiced') !== -1) status = 'Not Yet Invoiced';
+
+            results.push({doc: doc, status: status, index: i, raw: text.substring(0, 120)});
+        }
+        return results;
+    """)
+    return rows_info or []
+
+
+def select_specific_rows(driver: WebDriver, doc_numbers: list) -> int:
+    """Select rows whose freight document number matches one in doc_numbers.
+
+    Returns number of rows actually selected.
+    """
+    if not doc_numbers:
+        return 0
+
+    # Find the rows and their checkboxes
+    selected = 0
+    for doc in doc_numbers:
+        cb = driver.execute_script("""
+            var target = arguments[0];
+            var rows = document.querySelectorAll('.sapMListItems .sapMLIB, .sapMListTblRow');
+            for (var i = 0; i < rows.length; i++) {
+                if (rows[i].offsetParent === null) continue;
+                if (rows[i].classList.contains('sapMListTblHeader')) continue;
+                var text = rows[i].textContent.replace(/\\xAD/g, '').trim();
+                if (text.indexOf(target) !== -1) {
+                    return rows[i].querySelector('.sapMCb');
+                }
+            }
+            return null;
+        """, doc)
+
+        if cb:
+            try:
+                cb.click()
+                selected += 1
+                log.info("Selected row for doc %s", doc)
+            except Exception:
+                try:
+                    ActionChains(driver).move_to_element(cb).click().perform()
+                    selected += 1
+                    log.info("Selected row for doc %s (ActionChains)", doc)
+                except Exception as e:
+                    log.warning("Could not select row for doc %s: %s", doc, e)
+        else:
+            log.warning("Checkbox not found for doc %s", doc)
+
+    _time.sleep(0.5)
+    return selected
+
+
 def select_all_visible_rows(driver: WebDriver):
     """Select all visible document rows using native Selenium clicks on checkboxes."""
     # Find all visible checkboxes in data rows
@@ -246,8 +392,13 @@ def enter_invoice_number(driver: WebDriver, invoice_num: str):
     _time.sleep(1)
     wait_for_page_ready(driver)
 
-    # Find the Invoice input field
+    # Find the Invoice input field — prefer #invoiceId input on the draft page
     inv_input = driver.execute_script("""
+        // Strategy 1: find by input id containing 'invoiceId' (draft invoice page)
+        var byId = document.querySelector('input[id*="invoiceId"]:not([type="hidden"])');
+        if (byId && byId.offsetParent !== null) return byId;
+
+        // Strategy 2: find by "Invoice:" label
         var labels = document.querySelectorAll('label, span');
         for (var i = 0; i < labels.length; i++) {
             var clean = labels[i].textContent.replace(/\\xAD/g, '').trim();
@@ -264,18 +415,34 @@ def enter_invoice_number(driver: WebDriver, invoice_num: str):
     """)
 
     if inv_input:
-        inv_input.click()
-        _time.sleep(0.3)
-        inv_input.clear()
-        inv_input.send_keys(invoice_num)
-        log.info("Entered invoice number: %s", invoice_num)
+        # Scroll into view to avoid click interception from overlapping elements
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", inv_input)
+        _time.sleep(0.5)
+
+        # Focus + clear + send keys — avoid .click() which may be intercepted
+        try:
+            driver.execute_script("arguments[0].focus();", inv_input)
+            _time.sleep(0.3)
+            inv_input.clear()
+            inv_input.send_keys(invoice_num)
+            log.info("Entered invoice number: %s", invoice_num)
+        except Exception as e:
+            log.warning("Standard input failed: %s — trying JS value set", e)
+            # Fallback: set value via JS and dispatch input event
+            driver.execute_script("""
+                var el = arguments[0];
+                el.value = arguments[1];
+                el.dispatchEvent(new Event('input', {bubbles: true}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+            """, inv_input, invoice_num)
+            log.info("Entered invoice number via JS: %s", invoice_num)
     else:
         log.error("Invoice input field not found")
         take_screenshot(driver, "tile3_invoice_input_missing")
 
 
-def add_charge(driver: WebDriver, charge_type: str, amount: float):
-    """Add a charge in the Charges tab."""
+def add_charge(driver: WebDriver, charge_type: str, amount: float, doc_number: str = ""):
+    """Add a charge in the Charges tab for a specific freight document."""
     # Find the Charges tab element
     charges_tab = driver.execute_script("""
         var spans = document.querySelectorAll('span, div');
@@ -310,16 +477,53 @@ def add_charge(driver: WebDriver, charge_type: str, amount: float):
     wait_for_page_ready(driver)
     take_screenshot(driver, f"tile3_charges_tab_open_{charge_type[:15]}")
 
-    # Click Add button
+    # Click Add button for the correct freight doc section
+    # Each freight doc has its own "Add" button. Find the one near the target doc number.
     add_btn = driver.execute_script("""
+        var targetDoc = arguments[0];
+
+        if (targetDoc) {
+            // Find all sections/headers containing the freight doc number
+            var all = document.querySelectorAll('*');
+            for (var i = 0; i < all.length; i++) {
+                if (all[i].offsetParent === null) continue;
+                var t = all[i].textContent.replace(/\\xAD/g, '').trim();
+                // Match "Freight Document <number>" header
+                if (t.indexOf('Freight Document') !== -1 && t.indexOf(targetDoc) !== -1 && t.length < 100) {
+                    // Find the "Add" button within this section's parent
+                    var parent = all[i];
+                    for (var j = 0; j < 10 && parent; j++) {
+                        var addBtn = parent.querySelector('button');
+                        if (addBtn) {
+                            var bt = addBtn.textContent.replace(/\\xAD/g, '').trim();
+                            if (bt.indexOf('Add') !== -1) return addBtn;
+                        }
+                        // Check siblings too
+                        var sibling = parent.nextElementSibling;
+                        while (sibling) {
+                            var btn = sibling.querySelector('button');
+                            if (btn) {
+                                var st = btn.textContent.replace(/\\xAD/g, '').trim();
+                                if (st.indexOf('Add') !== -1) return btn;
+                            }
+                            sibling = sibling.nextElementSibling;
+                        }
+                        parent = parent.parentElement;
+                    }
+                }
+            }
+        }
+
+        // Fallback: if no doc_number specified or not found, use the last visible Add button
         var btns = document.querySelectorAll('button');
+        var lastAdd = null;
         for (var i = 0; i < btns.length; i++) {
             if (btns[i].offsetParent === null) continue;
             var t = btns[i].textContent.replace(/\\xAD/g, '').trim();
-            if (t === 'Add') return btns[i];
+            if (t === 'Add') lastAdd = btns[i];
         }
-        return null;
-    """)
+        return lastAdd;
+    """, doc_number)
     if add_btn:
         try:
             driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", add_btn)
@@ -327,7 +531,7 @@ def add_charge(driver: WebDriver, charge_type: str, amount: float):
             add_btn.click()
         except Exception:
             ActionChains(driver).move_to_element(add_btn).click().perform()
-        log.info("Clicked Add charge")
+        log.info("Clicked Add → new blank charge row")
         _time.sleep(1)
         wait_for_page_ready(driver)
     else:
@@ -335,62 +539,250 @@ def add_charge(driver: WebDriver, charge_type: str, amount: float):
         take_screenshot(driver, "tile3_add_charge_missing")
         return
 
-    # Select "Charge" from dropdown if prompted
-    driver.execute_script("""
-        var items = document.querySelectorAll('li, [class*="sapMSLI"], [role="option"]');
+    # Some Fiori versions show a dropdown after Add — if "Charge" appears, click it
+    charge_option_clicked = driver.execute_script("""
+        var items = document.querySelectorAll('li, [role="option"]');
         for (var i = 0; i < items.length; i++) {
             if (items[i].offsetParent === null) continue;
             var t = items[i].textContent.replace(/\\xAD/g, '').trim();
-            if (t === 'Charge') { items[i].click(); return; }
+            if (t === 'Charge') { items[i].click(); return true; }
         }
+        return false;
     """)
-    _time.sleep(1)
-    wait_for_page_ready(driver)
+    if charge_option_clicked:
+        log.info("Clicked 'Charge' from dropdown")
+        _time.sleep(1)
+        wait_for_page_ready(driver)
 
-    # Select charge category (e.g. "Waiting Charges")
-    driver.execute_script("""
-        var items = document.querySelectorAll('li, [class*="sapMSLI"], [role="option"], span');
-        for (var i = 0; i < items.length; i++) {
-            if (items[i].offsetParent === null) continue;
-            var t = items[i].textContent.replace(/\\xAD/g, '').trim();
-            if (t === arguments[0]) { items[i].click(); return; }
-        }
-    """, charge_type)
-    _time.sleep(1)
-    wait_for_page_ready(driver)
+    take_screenshot(driver, f"tile3_blank_charge_row_{charge_type[:15]}")
 
-    # Enter amount in the rate/amount field — find the last visible input with numeric type
-    driver.execute_script("""
-        var inputs = document.querySelectorAll('input[type="text"], input:not([type="hidden"])');
-        var rateInput = null;
-        for (var i = 0; i < inputs.length; i++) {
-            if (inputs[i].offsetParent === null) continue;
-            var al = (inputs[i].getAttribute('aria-label') || '').toLowerCase();
-            var ph = (inputs[i].placeholder || '').toLowerCase();
-            if (al.indexOf('rate') !== -1 || al.indexOf('amount') !== -1 ||
-                ph.indexOf('rate') !== -1 || ph.indexOf('amount') !== -1) {
-                rateInput = inputs[i];
+    # DEBUG: dump HTML around the charges area to find the exact blank field element
+    debug_html = driver.execute_script("""
+        // Find the area near "Freight Document" text
+        var all = document.querySelectorAll('*');
+        var results = [];
+        for (var i = 0; i < all.length; i++) {
+            if (all[i].offsetParent === null) continue;
+            var t = all[i].textContent.replace(/\\xAD/g, '').trim();
+            if (t.indexOf('Freight Document') !== -1 && t.length < 50) {
+                // Dump the parent's HTML
+                var parent = all[i].closest('tr, div, section') || all[i].parentElement;
+                if (parent) results.push(parent.outerHTML.substring(0, 500));
             }
         }
-        if (rateInput) {
-            rateInput.focus();
-            rateInput.value = '';
-            rateInput.dispatchEvent(new Event('input', {bubbles: true}));
+        // Also find all visible inputs with empty values
+        var emptyInputs = [];
+        var inputs = document.querySelectorAll('input:not([type="hidden"])');
+        for (var i = 0; i < inputs.length; i++) {
+            if (inputs[i].offsetParent === null) continue;
+            if (inputs[i].value.trim() === '' || inputs[i].value.trim().length < 3) {
+                emptyInputs.push({
+                    id: inputs[i].id,
+                    type: inputs[i].type,
+                    value: inputs[i].value,
+                    ariaLabel: inputs[i].getAttribute('aria-label'),
+                    placeholder: inputs[i].placeholder,
+                    className: inputs[i].className.substring(0, 80)
+                });
+            }
         }
-        return rateInput;
+        return {freightDocHTML: results, emptyInputs: emptyInputs};
     """)
-    # Use Selenium to type the amount (JS value setting may not trigger SAP bindings)
-    rate_inputs = driver.find_elements(By.CSS_SELECTOR, "input")
-    for inp in reversed(rate_inputs):
+    log.info("DEBUG charge area — freight doc HTML: %s", str(debug_html.get('freightDocHTML', []))[:500])
+    log.info("DEBUG charge area — empty inputs: %s", debug_html.get('emptyInputs', []))
+
+    # Click the BLANK input field in the Charge Description column
+    # This field is on the SAME LINE as the freight document header row,
+    # NOT in a separate data row. It looks like a text input but is read-only —
+    # clicking it opens a category selection popup.
+    blank_field = driver.execute_script("""
+        // The blank field is a sapMInputBaseInner inside a sapMInput control
+        // ID pattern: __input0-__cloneN-inner
+        // We need to click the PARENT sapMInput wrapper or its value help icon,
+        // not the inner input directly
+
+        // Find the empty sapMInputBaseInner (the one we identified in debug)
+        var inputs = document.querySelectorAll('input.sapMInputBaseInner');
+        var target = null;
+        for (var i = 0; i < inputs.length; i++) {
+            if (inputs[i].offsetParent === null) continue;
+            if (inputs[i].value.trim() === '' && inputs[i].type === 'text') {
+                // Skip the search bar
+                if (inputs[i].id.indexOf('Search') !== -1 || inputs[i].id.indexOf('search') !== -1) continue;
+                target = inputs[i];
+                break;
+            }
+        }
+        if (!target) return null;
+
+        // Try to find the value help icon button next to this input
+        // SAP places it as a sibling or inside the parent sapMInput wrapper
+        var parent = target.closest('.sapMInput, .sapMInputBase, [class*="sapMInput"]');
+        if (parent) {
+            var vhIcon = parent.querySelector('[class*="ValueHelp"], .sapMInputBaseIcon, .sapUiIcon');
+            if (vhIcon && vhIcon.offsetParent !== null) return vhIcon;
+            // No icon — return the parent wrapper itself
+            return parent;
+        }
+        return target;
+    """)
+
+    if blank_field:
         try:
-            al = inp.get_attribute("aria-label") or ""
-            if "rate" in al.lower() or "amount" in al.lower():
-                inp.clear()
-                inp.send_keys(str(amount))
-                log.info("Entered charge amount: %s", amount)
-                break
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", blank_field)
+            _time.sleep(0.5)
+            blank_field.click()
+            log.info("Clicked blank charge description input (native)")
         except Exception:
-            continue
+            try:
+                ActionChains(driver).move_to_element(blank_field).click().perform()
+                log.info("Clicked blank field (ActionChains)")
+            except Exception:
+                driver.execute_script("arguments[0].click();", blank_field)
+                log.info("Clicked blank field (JS)")
+        _time.sleep(2)
+        wait_for_page_ready(driver)
+        take_screenshot(driver, f"tile3_after_blank_field_click_{charge_type[:15]}")
+    else:
+        log.warning("Could not find blank charge description input")
+
+    take_screenshot(driver, f"tile3_category_popup_opening_{charge_type[:15]}")
+
+    # In the popup that opens: search for charge_type in the search bar
+    search_input = driver.execute_script("""
+        var dialogs = document.querySelectorAll('[class*="sapMDialog"], [role="dialog"]');
+        for (var i = dialogs.length - 1; i >= 0; i--) {
+            var d = dialogs[i];
+            if (d.offsetParent === null) continue;
+            // Find the search input in the dialog
+            var searchInput = d.querySelector('input[type="search"], input[placeholder*="earch"], input.sapMInputBaseInner');
+            if (searchInput && searchInput.offsetParent !== null) return searchInput;
+        }
+        return null;
+    """)
+
+    if search_input:
+        try:
+            driver.execute_script("arguments[0].focus();", search_input)
+            _time.sleep(0.3)
+            search_input.clear()
+            search_input.send_keys(charge_type)
+            log.info("Typed '%s' in charge category search", charge_type)
+            _time.sleep(1.5)  # let search results filter
+            take_screenshot(driver, f"tile3_charge_searched_{charge_type[:15]}")
+        except Exception as e:
+            log.warning("Search input type failed: %s", e)
+    else:
+        log.warning("Search input not found in category popup — charge type may still be visible")
+
+    # Click the matching search result row — must use native click
+    # The popup shows a table: Description | Charge Code | Charge Type
+    # Find the row element via JS, then click with Selenium native click
+    result_row = driver.execute_script("""
+        var target = arguments[0].toLowerCase();
+        var dialogs = document.querySelectorAll('[class*="sapMDialog"], [role="dialog"]');
+        for (var i = dialogs.length - 1; i >= 0; i--) {
+            var d = dialogs[i];
+            if (d.offsetParent === null) continue;
+            // Search in table rows and list items
+            var items = d.querySelectorAll('tr, li, [role="row"], .sapMLIB');
+            for (var j = 0; j < items.length; j++) {
+                if (items[j].offsetParent === null) continue;
+                var t = items[j].textContent.replace(/\\xAD/g, '').trim().toLowerCase();
+                if (t.indexOf(target) !== -1 && t.length < 200) {
+                    return items[j];
+                }
+            }
+        }
+        return null;
+    """, charge_type)
+
+    if result_row:
+        # Native click on the result row
+        try:
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", result_row)
+            _time.sleep(0.3)
+            result_row.click()
+            log.info("Selected category row (native click)")
+        except Exception:
+            try:
+                ActionChains(driver).move_to_element(result_row).click().perform()
+                log.info("Selected category row (ActionChains)")
+            except Exception:
+                driver.execute_script("arguments[0].click();", result_row)
+                log.info("Selected category row (JS)")
+        _time.sleep(2)
+        wait_for_page_ready(driver)
+    else:
+        log.error("Could not find '%s' in category search results", charge_type)
+        take_screenshot(driver, f"tile3_category_not_found_{charge_type[:15]}")
+        dismiss_any_popup(driver)
+        return
+
+    take_screenshot(driver, f"tile3_category_selected_{charge_type[:15]}")
+
+    # Enter the charge amount in the Rate Amount/Unit column
+    _time.sleep(3)  # SAP needs time to update the row after category selection
+    wait_for_page_ready(driver)
+
+    # Debug: dump all visible inputs to find the rate field
+    debug_inputs = driver.execute_script("""
+        var inputs = document.querySelectorAll('input:not([type="hidden"]):not([type="file"])');
+        var results = [];
+        for (var i = 0; i < inputs.length; i++) {
+            if (inputs[i].offsetParent === null) continue;
+            results.push({
+                id: inputs[i].id.substring(0, 60),
+                value: inputs[i].value,
+                ariaLabel: inputs[i].getAttribute('aria-label'),
+                type: inputs[i].type
+            });
+        }
+        return results;
+    """)
+    log.info("DEBUG visible inputs for rate: %s", debug_inputs)
+
+    rate_input_el = driver.execute_script("""
+        // The rate input has ID containing 'rateInput' and value '0.00' or '0'
+        // For the correct leg, find the one with value 0.00 (the just-added charge row)
+        var inputs = document.querySelectorAll('input[id*="rateInput"]');
+        for (var i = 0; i < inputs.length; i++) {
+            if (inputs[i].offsetParent === null) continue;
+            var val = inputs[i].value.trim();
+            if (val === '0.00' || val === '0' || val === '') {
+                return inputs[i];
+            }
+        }
+
+        // Fallback: any visible input with id containing 'rate' and zero value
+        var allInputs = document.querySelectorAll('input');
+        for (var i = 0; i < allInputs.length; i++) {
+            if (allInputs[i].offsetParent === null) continue;
+            var id = (allInputs[i].id || '').toLowerCase();
+            var val = allInputs[i].value.trim();
+            if (id.indexOf('rate') !== -1 && (val === '0.00' || val === '0' || val === '')) {
+                return allInputs[i];
+            }
+        }
+
+        return null;
+    """)
+
+    if rate_input_el:
+        try:
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", rate_input_el)
+            _time.sleep(0.3)
+            driver.execute_script("arguments[0].focus();", rate_input_el)
+            _time.sleep(0.2)
+            rate_input_el.clear()
+            rate_input_el.send_keys(str(amount))
+            log.info("Entered charge amount: %s", amount)
+        except Exception as e:
+            log.warning("Could not enter amount: %s", e)
+    else:
+        log.error("Rate Amount input not found in new charge row")
+        take_screenshot(driver, f"tile3_rate_input_missing_{charge_type[:15]}")
+
     _time.sleep(0.5)
     take_screenshot(driver, f"tile3_charge_added_{charge_type[:15]}")
 
@@ -476,10 +868,10 @@ def fill_invoice_and_submit(driver: WebDriver, row: InvoiceRow,
     enter_invoice_number(driver, row.invoice)
 
     if row.has_charges_leg1:
-        add_charge(driver, row.charge_type_1, row.charge_amount_1)
+        add_charge(driver, row.charge_type_1, row.charge_amount_1, doc_number=row.document_1)
 
     if row.is_collective and row.has_charges_leg2:
-        add_charge(driver, row.charge_type_2, row.charge_amount_2)
+        add_charge(driver, row.charge_type_2, row.charge_amount_2, doc_number=row.document_2)
 
     if row.pause:
         # Paused: Save instead of Submit — human will review and submit manually
@@ -701,18 +1093,76 @@ def process_row(driver: WebDriver, row: InvoiceRow,
 
     try:
         # Filter
+        expected_docs = [row.document_1]
         if row.is_collective:
             filter_collective_documents(driver, row.document_1, row.document_2)
+            expected_docs.append(row.document_2)
         else:
             filter_single_document(driver, row.document_1)
 
         take_screenshot(driver, f"tile3_filtered_{row.document_1}")
 
-        # Select rows
-        select_all_visible_rows(driver)
+        # Step 1: Check if docs appear in the default "To be Invoiced" tab
+        visible_rows = count_visible_rows(driver)
+        log.info("Visible rows after filter in default tab: %d", visible_rows)
 
-        # Create invoice
-        if not click_create_invoice(driver, collective=row.is_collective):
+        usable_docs = []  # docs that can be invoiced
+        skipped_docs = []  # docs skipped (already Completely invoiced)
+
+        if visible_rows == len(expected_docs):
+            # All expected docs are in To be Invoiced tab — good, use all
+            log.info("All %d docs found in 'To be Invoiced' tab", visible_rows)
+            usable_docs = expected_docs
+            # Use select_all since we want all of them
+            select_all_visible_rows(driver)
+        else:
+            # Not all docs in default tab — check All tab
+            log.info("Only %d of %d docs in default tab — checking All tab",
+                     visible_rows, len(expected_docs))
+            if not click_all_tab_tile3(driver):
+                return "error: could not click All tab to check status"
+
+            _time.sleep(2)  # extra time for tab content to render
+            wait_for_page_ready(driver)
+            take_screenshot(driver, f"tile3_all_tab_{row.document_1}")
+
+            rows_info = read_row_doc_and_status(driver)
+            log.info("All tab rows: %s", rows_info)
+
+            # Check status of each expected doc
+            for doc in expected_docs:
+                found = next((r for r in rows_info if r.get("doc") == doc), None)
+                if not found:
+                    skipped_docs.append((doc, "not found in All tab"))
+                    log.warning("Doc %s not found anywhere", doc)
+                elif found.get("status") == "Completely invoiced":
+                    skipped_docs.append((doc, "already Completely invoiced"))
+                    log.warning("Doc %s is already Completely invoiced — skipping", doc)
+                else:
+                    # Invoicing in process or Not Yet Invoiced — usable
+                    usable_docs.append(doc)
+
+            if not usable_docs:
+                # Nothing to invoice for this row
+                error_detail = "; ".join(f"{d}: {r}" for d, r in skipped_docs) or "no usable docs"
+                return f"error: {error_detail}"
+
+            log.info("Usable docs: %s | Skipped: %s", usable_docs, skipped_docs)
+
+            # Select only the usable docs
+            selected = select_specific_rows(driver, usable_docs)
+            if selected == 0:
+                return "error: could not select any usable docs"
+
+        # Store skipped info on the row for later status reporting
+        if skipped_docs:
+            row._skipped_note = "skipped: " + "; ".join(f"{d} ({r})" for d, r in skipped_docs)
+        else:
+            row._skipped_note = ""
+
+        # Create invoice (Collective if 2 usable, single if 1)
+        is_collective = len(usable_docs) > 1
+        if not click_create_invoice(driver, collective=is_collective):
             return "error: Create Invoice button not found"
 
         # Check if invoice page opened (look for Invoice Details tab)
@@ -801,7 +1251,11 @@ def run(driver: WebDriver, *, dry_run: bool = False, step_through: bool = False,
 
         if status == "submitted":
             results["submitted"] += 1
-            mark_tile3_done(row)  # stays in To Do for tile 4
+            note = getattr(row, '_skipped_note', '')
+            if note:
+                mark_tile3_done_with_note(row, note)
+            else:
+                mark_tile3_done(row)  # stays in To Do for tile 4
         elif status == "paused":
             results["paused"] += 1
             mark_tile3_paused(row)

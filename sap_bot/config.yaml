@@ -4,7 +4,7 @@ browser: "edge"                  # "edge" or "chrome"
 excel_path: "../SAP_bot.xlsx"    # relative to sap_bot/ folder, or absolute path
 
 autonomous_interval_minutes: 120 # how often tiles 1 & 2 auto-run. Currently 120min = every 2 hours
-dry_run: false                    # SAFETY: if true, bot navigates but never clicks Submit/Confirm/Report
+dry_run: true                    # SAFETY: if true, bot navigates but never clicks Submit/Confirm/Report
 
 # Step-through mode: pause before every destructive action (tiles 3 & 4)
 step_through: false
