@@ -191,24 +191,44 @@ def click_all_tab_tile3(driver: WebDriver):
     _time.sleep(2)
     wait_for_page_ready(driver)
 
-    # Find the All tab — try a few times since headless rendering can be slow
+    # Find the All tab — look specifically within the tabs that include "Invoiced" sibling tabs
     from selenium.webdriver.support.ui import WebDriverWait
     all_tab = None
     js_finder = """
-        // Search ANY element (don't restrict to offsetParent — headless can be weird)
-        var tabs = document.querySelectorAll('[role="tab"], .sapMITBFilter, .sapMITBItem, span, div');
-        for (var i = 0; i < tabs.length; i++) {
-            var t = tabs[i].textContent.replace(/\\xAD/g, '').replace(/\\s+/g, ' ').trim();
-            if (/^All\\s*\\(\\d+\\)$/.test(t) || /^All\\s*\\(\\d/.test(t)) {
-                // Prefer a clickable parent (tab role or ITB element)
-                var clickable = tabs[i].closest('[role="tab"], [class*="sapMITB"]');
-                return clickable || tabs[i];
-            }
-            if (t === 'All' && (tabs[i].getAttribute('role') === 'tab' ||
-                                 tabs[i].className.indexOf('sapMITB') !== -1)) {
-                return tabs[i];
+        // Find the tab bar that contains "To be Invoiced" — that's where the "All" tab lives
+        // Strategy: find the element containing "To be Invoiced" text, then look for a sibling "All (N)" tab
+        var invoiceMarkers = document.querySelectorAll('[role="tab"], .sapMITBFilter, .sapMITBItem');
+        var tabBar = null;
+        for (var i = 0; i < invoiceMarkers.length; i++) {
+            var t = invoiceMarkers[i].textContent.replace(/\\xAD/g, '').replace(/\\s+/g, ' ').trim();
+            if (t.indexOf('To be Invoiced') !== -1 || t.indexOf('Invoicing in Process') !== -1) {
+                // Walk up to find the common tab container
+                tabBar = invoiceMarkers[i].closest('[class*="sapMITBHeader"], [class*="sapMITBContainer"], [role="tablist"]');
+                if (!tabBar) tabBar = invoiceMarkers[i].parentElement;
+                break;
             }
         }
+
+        if (tabBar) {
+            // Look for "All (N)" tab within this bar's siblings
+            var tabsInBar = tabBar.querySelectorAll('[role="tab"], .sapMITBFilter, .sapMITBItem');
+            for (var i = 0; i < tabsInBar.length; i++) {
+                var t = tabsInBar[i].textContent.replace(/\\xAD/g, '').replace(/\\s+/g, ' ').trim();
+                if (/^All\\s*\\(\\d+\\)$/.test(t) || /^All\\s*\\(\\d/.test(t)) {
+                    return tabsInBar[i];
+                }
+            }
+        }
+
+        // Fallback: any tab-role element with "All (N)" pattern
+        var allTabs = document.querySelectorAll('[role="tab"], .sapMITBFilter, .sapMITBItem');
+        for (var i = 0; i < allTabs.length; i++) {
+            var t = allTabs[i].textContent.replace(/\\xAD/g, '').replace(/\\s+/g, ' ').trim();
+            if (/^All\\s*\\(\\d+\\)$/.test(t)) {
+                return allTabs[i];
+            }
+        }
+
         return null;
     """
     try:
@@ -222,6 +242,10 @@ def click_all_tab_tile3(driver: WebDriver):
         log.warning("'All' tab not found after waiting")
         take_screenshot(driver, "tile3_all_tab_not_found")
         return False
+
+    # Log which element we actually found (for debugging)
+    log.info("Found 'All' tab element with text: %s",
+             driver.execute_script("return arguments[0].textContent.replace(/\\xAD/g,'').replace(/\\s+/g,' ').trim().substring(0, 50);", all_tab))
 
     # Native click — JS click doesn't trigger SAP UI5 tab switch
     try:
