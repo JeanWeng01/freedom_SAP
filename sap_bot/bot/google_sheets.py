@@ -35,13 +35,14 @@ STATUS_TAB = "Status"
 # Column indices (0-based) in the To Do tab
 COL_DOC1 = 0         # A
 COL_DOC2 = 1         # B
-COL_INVOICE = 2      # C
-COL_POD_FILENAME = 3 # D
-COL_CHARGE_HRS1 = 4  # E
-COL_CHARGE_HRS2 = 5  # F
-COL_PAUSE = 6        # G
-# Col H (7): local run heartbeat timestamp (single cell H1)
-COL_TODO_STATUS = 8  # I — bot writes: "invoiced", "paused", "tile3_in_progress", etc.
+# Col C (2): human notes — bot IGNORES this column
+COL_INVOICE = 3      # D
+COL_POD_FILENAME = 4 # E
+COL_CHARGE_HRS1 = 5  # F
+COL_CHARGE_HRS2 = 6  # G
+COL_PAUSE = 7        # H
+# Col I (8): local run heartbeat timestamp (single cell I2)
+COL_TODO_STATUS = 9  # J — bot writes: "invoiced", "paused", "tile3_in_progress", etc.
 
 
 @dataclass
@@ -55,6 +56,7 @@ class InvoiceRow:
     charge_hours_1: float | None
     charge_hours_2: float | None
     pause: bool  # True = skip submit, save instead
+    notes: str = ""  # human notes from col C — bot ignores for processing but preserves when moving to Status
 
     @property
     def is_collective(self) -> bool:
@@ -158,7 +160,7 @@ def read_todo_items() -> list[InvoiceRow]:
     service = _get_sheets_service()
     result = service.spreadsheets().values().get(
         spreadsheetId=SHEET_ID,
-        range=f"'{TODO_TAB}'!A:I",
+        range=f"'{TODO_TAB}'!A:J",
     ).execute()
 
     rows = result.get("values", [])
@@ -184,6 +186,7 @@ def read_todo_items() -> list[InvoiceRow]:
             charge_hours_1=_float_val(row, COL_CHARGE_HRS1),
             charge_hours_2=_float_val(row, COL_CHARGE_HRS2),
             pause=is_paused,
+            notes=_cell_val(row, 2) or "",  # col C human notes
         )
         items.append(item)
 
@@ -197,29 +200,34 @@ def move_to_status(item: InvoiceRow, status: str,
                    pod_uploaded_1: str = "", pod_uploaded_2: str = ""):
     """Move a row from 'To Do' to 'Status' tab with processing info.
 
-    Status tab columns: A-F (same data) + G-K (processing info)
+    Status tab columns:
+      A: Document_1  B: Document_2  C: Notes  D: Invoice  E: POD_Filename
+      F: Charge_Hrs_1  G: Charge_Hrs_2
+      H: Processed_At_1  I: Processed_At_2
+      J: POD_Uploaded_1  K: POD_Uploaded_2
+      L: Status
     """
     service = _get_sheets_service()
 
-    # Build the row: A-F data + G-K processing info
     row_data = [
         item.document_1,
         item.document_2 or "",
-        item.invoice,
-        item.pod_filename,
-        item.charge_hours_1 if item.charge_hours_1 is not None else "",
-        item.charge_hours_2 if item.charge_hours_2 is not None else "",
-        processed_at_1,     # G: Processed_At_1
-        processed_at_2,     # H: Processed_At_2
-        pod_uploaded_1,     # I: POD_Uploaded_1
-        pod_uploaded_2,     # J: POD_Uploaded_2
-        status,             # K: Status
+        item.notes,                                                           # C: Notes
+        item.invoice,                                                         # D: Invoice
+        item.pod_filename,                                                    # E: POD_Filename
+        item.charge_hours_1 if item.charge_hours_1 is not None else "",       # F
+        item.charge_hours_2 if item.charge_hours_2 is not None else "",       # G
+        processed_at_1,                                                       # H
+        processed_at_2,                                                       # I
+        pod_uploaded_1,                                                       # J
+        pod_uploaded_2,                                                       # K
+        status,                                                               # L
     ]
 
-    # Append to Status tab (no bold — use RAW input)
+    # Append to Status tab
     service.spreadsheets().values().append(
         spreadsheetId=SHEET_ID,
-        range=f"'{STATUS_TAB}'!A:K",
+        range=f"'{STATUS_TAB}'!A:L",
         valueInputOption="RAW",
         insertDataOption="INSERT_ROWS",
         body={"values": [row_data]},
@@ -259,14 +267,14 @@ def _apply_status_colors(service, status: str, pod1: str, pod2: str):
 
         row_index = last_row - 1  # 0-based for batchUpdate
 
-        # Determine colors for each cell (G through K)
+        # Determine colors for each cell (H through L — cols shifted right by 1 due to notes col)
         requests = []
         cells_to_color = [
-            (6, True),                                          # G: Processed_At_1 — always green if filled
-            (7, True),                                          # H: Processed_At_2
-            (8, not pod1.startswith("error")),                  # I: POD_Uploaded_1
-            (9, not pod2.startswith("error")),                  # J: POD_Uploaded_2
-            (10, not status.startswith("error")),               # K: Status
+            (7, True),                                          # H: Processed_At_1
+            (8, True),                                          # I: Processed_At_2
+            (9, not pod1.startswith("error")),                  # J: POD_Uploaded_1
+            (10, not pod2.startswith("error")),                 # K: POD_Uploaded_2
+            (11, not status.startswith("error")),               # L: Status
         ]
 
         for col_index, is_success in cells_to_color:
@@ -357,7 +365,7 @@ def mark_error(item: InvoiceRow, error_msg: str):
 def is_local_run_active(max_age_seconds: int = 1800) -> bool:
     """Check if a local bot run is currently active (by reading a lock cell).
 
-    Local runs write a timestamp to 'To Do'!H2. If that timestamp is fresh
+    Local runs write a timestamp to 'To Do'!I2. If that timestamp is fresh
     (within max_age_seconds), consider a local run active.
 
     max_age_seconds: how recently the local run must have heartbeat to be
@@ -367,7 +375,7 @@ def is_local_run_active(max_age_seconds: int = 1800) -> bool:
     try:
         res = service.spreadsheets().values().get(
             spreadsheetId=SHEET_ID,
-            range=f"'{TODO_TAB}'!H2",
+            range=f"'{TODO_TAB}'!I2",
         ).execute()
         vals = res.get("values", [])
         if not vals or not vals[0]:
@@ -388,14 +396,14 @@ def is_local_run_active(max_age_seconds: int = 1800) -> bool:
 
 
 def write_local_run_heartbeat():
-    """Mark that a local run is active by writing current timestamp to 'To Do'!H2."""
+    """Mark that a local run is active by writing current timestamp to 'To Do'!I2."""
     service = _get_sheets_service()
     try:
         from datetime import datetime
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         service.spreadsheets().values().update(
             spreadsheetId=SHEET_ID,
-            range=f"'{TODO_TAB}'!H2",
+            range=f"'{TODO_TAB}'!I2",
             valueInputOption="RAW",
             body={"values": [[ts]]},
         ).execute()
@@ -410,7 +418,7 @@ def clear_local_run_heartbeat():
     try:
         service.spreadsheets().values().update(
             spreadsheetId=SHEET_ID,
-            range=f"'{TODO_TAB}'!H2",
+            range=f"'{TODO_TAB}'!I2",
             valueInputOption="RAW",
             body={"values": [[""]]},
         ).execute()
@@ -425,13 +433,13 @@ def read_todo_status(document_1: str) -> str:
     try:
         doc_col = service.spreadsheets().values().get(
             spreadsheetId=SHEET_ID,
-            range=f"'{TODO_TAB}'!A:I",
+            range=f"'{TODO_TAB}'!A:J",
         ).execute().get("values", [])
         for idx, r in enumerate(doc_col):
             if idx == 0:
                 continue
             if r and str(r[0]).strip() == document_1:
-                return r[8] if len(r) > 8 else ""
+                return r[9] if len(r) > 9 else ""
     except Exception as e:
         log.warning("Could not read To Do status for %s: %s", document_1, e)
     return ""
@@ -465,7 +473,7 @@ def _write_todo_status(document_1: str, status_text: str, color: str = "auto"):
         # Write the value to col I (status column)
         service.spreadsheets().values().update(
             spreadsheetId=SHEET_ID,
-            range=f"'{TODO_TAB}'!I{target_idx + 1}",
+            range=f"'{TODO_TAB}'!J{target_idx + 1}",
             valueInputOption="RAW",
             body={"values": [[status_text]]},
         ).execute()
@@ -503,8 +511,8 @@ def _write_todo_status(document_1: str, status_text: str, color: str = "auto"):
                             "sheetId": todo_sheet_id,
                             "startRowIndex": target_idx,
                             "endRowIndex": target_idx + 1,
-                            "startColumnIndex": 8,  # I (Status column)
-                            "endColumnIndex": 9,
+                            "startColumnIndex": 9,  # J (Status column)
+                            "endColumnIndex": 10,
                         },
                         "cell": {
                             "userEnteredFormat": {
@@ -574,10 +582,10 @@ def sort_paused_rows_to_top():
                         "sheetId": todo_sheet_id,
                         "startRowIndex": 1,  # skip header
                         "startColumnIndex": 0,
-                        "endColumnIndex": 9,  # A through I
+                        "endColumnIndex": 10,  # A through J
                     },
                     "sortSpecs": [{
-                        "dimensionIndex": COL_PAUSE,  # col G
+                        "dimensionIndex": COL_PAUSE,  # col H
                         "sortOrder": "DESCENDING",
                     }],
                 }
