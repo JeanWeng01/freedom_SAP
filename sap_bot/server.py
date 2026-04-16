@@ -81,90 +81,101 @@ run_status = {
 
 
 def run_tile(tile_num: int, dry_run: bool = False) -> dict:
-    """Execute a single tile. Returns result dict."""
+    """Execute a single tile. Returns result dict.
+
+    Uses a global lock to serialize ALL tile runs — only one tile runs at a time
+    (regardless of which tile). This prevents different tiles from running in parallel
+    Chrome processes that could conflict or exhaust resources.
+    """
     tile_key = f"tile{tile_num}"
 
-    if run_status[tile_key]["running"]:
-        return {"error": f"Tile {tile_num} is already running"}
+    # Check if any tile is running before acquiring the lock (for fast return)
+    if any(run_status[f"tile{n}"]["running"] for n in [1, 2, 3, 4]):
+        log.info("Tile %d: another tile is running, waiting for lock...", tile_num)
 
-    run_status[tile_key]["running"] = True
-    start_time = datetime.now().isoformat()
+    # Acquire global lock — blocks until any currently-running tile finishes
+    with run_lock:
+        if run_status[tile_key]["running"]:
+            return {"error": f"Tile {tile_num} is already running"}
 
-    driver = None
-    try:
-        driver = create_driver(CFG.get("browser", "chrome"))
-        success = login(driver, CFG["login_url"], CFG["launchpad_url"],
-                        CFG["username"], CFG["password"])
-        if not success:
-            result = {"status": "error", "error": "Login failed", "started": start_time}
+        run_status[tile_key]["running"] = True
+        start_time = datetime.now().isoformat()
+
+        driver = None
+        try:
+            driver = create_driver(CFG.get("browser", "chrome"))
+            success = login(driver, CFG["login_url"], CFG["launchpad_url"],
+                            CFG["username"], CFG["password"])
+            if not success:
+                result = {"status": "error", "error": "Login failed", "started": start_time}
+                run_status[tile_key]["result"] = result
+                return result
+
+            if tile_num == 1:
+                counts = tile1_confirmation.run(driver, dry_run=dry_run)
+                result = {
+                    "status": "completed",
+                    "tile": 1,
+                    "new_confirmed": counts.get("new", 0),
+                    "updated_confirmed": counts.get("updated", 0),
+                    "total_confirmed": counts.get("total", 0),
+                    "dry_run": dry_run,
+                    "started": start_time,
+                    "finished": datetime.now().isoformat(),
+                }
+            elif tile_num == 2:
+                count = tile2_reporting.run(driver, dry_run=dry_run)
+                result = {
+                    "status": "completed",
+                    "tile": 2,
+                    "stops_reported": count,
+                    "dry_run": dry_run,
+                    "started": start_time,
+                    "finished": datetime.now().isoformat(),
+                }
+            elif tile_num == 3:
+                counts = tile3_invoicing.run(driver, dry_run=dry_run)
+                result = {
+                    "status": "completed",
+                    "tile": 3,
+                    **counts,
+                    "dry_run": dry_run,
+                    "started": start_time,
+                    "finished": datetime.now().isoformat(),
+                }
+            elif tile_num == 4:
+                counts = tile4_pod_upload.run(driver, dry_run=dry_run)
+                result = {
+                    "status": "completed",
+                    "tile": 4,
+                    **counts,
+                    "dry_run": dry_run,
+                    "started": start_time,
+                    "finished": datetime.now().isoformat(),
+                }
+            else:
+                result = {"status": "error", "error": f"Unknown tile {tile_num}"}
+
+        except Exception as e:
+            log.error("Tile %d failed: %s", tile_num, e, exc_info=True)
+            result = {
+                "status": "error",
+                "tile": tile_num,
+                "error": str(e),
+                "started": start_time,
+                "finished": datetime.now().isoformat(),
+            }
+        finally:
+            if driver:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+            run_status[tile_key]["running"] = False
+            run_status[tile_key]["last_run"] = datetime.now().isoformat()
             run_status[tile_key]["result"] = result
-            return result
 
-        if tile_num == 1:
-            counts = tile1_confirmation.run(driver, dry_run=dry_run)
-            result = {
-                "status": "completed",
-                "tile": 1,
-                "new_confirmed": counts.get("new", 0),
-                "updated_confirmed": counts.get("updated", 0),
-                "total_confirmed": counts.get("total", 0),
-                "dry_run": dry_run,
-                "started": start_time,
-                "finished": datetime.now().isoformat(),
-            }
-        elif tile_num == 2:
-            count = tile2_reporting.run(driver, dry_run=dry_run)
-            result = {
-                "status": "completed",
-                "tile": 2,
-                "stops_reported": count,
-                "dry_run": dry_run,
-                "started": start_time,
-                "finished": datetime.now().isoformat(),
-            }
-        elif tile_num == 3:
-            counts = tile3_invoicing.run(driver, dry_run=dry_run)
-            result = {
-                "status": "completed",
-                "tile": 3,
-                **counts,
-                "dry_run": dry_run,
-                "started": start_time,
-                "finished": datetime.now().isoformat(),
-            }
-        elif tile_num == 4:
-            counts = tile4_pod_upload.run(driver, dry_run=dry_run)
-            result = {
-                "status": "completed",
-                "tile": 4,
-                **counts,
-                "dry_run": dry_run,
-                "started": start_time,
-                "finished": datetime.now().isoformat(),
-            }
-        else:
-            result = {"status": "error", "error": f"Unknown tile {tile_num}"}
-
-    except Exception as e:
-        log.error("Tile %d failed: %s", tile_num, e, exc_info=True)
-        result = {
-            "status": "error",
-            "tile": tile_num,
-            "error": str(e),
-            "started": start_time,
-            "finished": datetime.now().isoformat(),
-        }
-    finally:
-        if driver:
-            try:
-                driver.quit()
-            except Exception:
-                pass
-        run_status[tile_key]["running"] = False
-        run_status[tile_key]["last_run"] = datetime.now().isoformat()
-        run_status[tile_key]["result"] = result
-
-    return result
+        return result
 
 
 def cleanup_old_logs(max_age_days: int = 7):
@@ -195,8 +206,22 @@ def run_tile_with_retry(tile_num: int, dry_run: bool = False, max_retries: int =
     return result
 
 
+def _local_run_active() -> bool:
+    """Check the Google Sheet lock cell — if a local run is active, skip."""
+    try:
+        from bot.google_sheets import is_local_run_active
+        return is_local_run_active()
+    except Exception as e:
+        log.warning("Could not check local run status: %s", e)
+        return False
+
+
 def run_auto_cycle_12():
     """Run tiles 1 & 2 in sequence with retry."""
+    if _local_run_active():
+        log.warning("Local run is active — SKIPPING scheduled tiles 1 & 2")
+        return
+
     log.info("═══ Tiles 1 & 2 auto cycle starting ═══")
     cleanup_old_logs(max_age_days=7)
     run_status["last_auto_run"] = datetime.now().isoformat()
@@ -212,6 +237,10 @@ def run_auto_cycle_12():
 
 def run_auto_cycle_34():
     """Run tiles 3 & 4 in sequence with retry."""
+    if _local_run_active():
+        log.warning("Local run is active — SKIPPING scheduled tiles 3 & 4")
+        return
+
     log.info("═══ Tiles 3 & 4 auto cycle starting ═══")
     run_status["last_invoice_run"] = datetime.now().isoformat()
 
@@ -426,11 +455,13 @@ def trigger_all():
     def _run():
         run_tile(1, dry_run=dry_run)
         run_tile(2, dry_run=dry_run)
+        run_tile(3, dry_run=dry_run)
+        run_tile(4, dry_run=dry_run)
 
     t = threading.Thread(target=_run, daemon=True)
     t.start()
     return jsonify({
-        "message": f"Tiles 1 & 2 triggered (dry_run={dry_run})",
+        "message": f"All tiles (1, 2, 3, 4) triggered (dry_run={dry_run})",
         "check_status": "/status",
     })
 

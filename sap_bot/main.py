@@ -211,6 +211,33 @@ def main():
             print("  Exiting.")
             return
 
+    # Write heartbeat so Railway scheduler skips while this local run is active
+    heartbeat_thread = None
+    heartbeat_stop = threading.Event() if False else None  # placeholder
+    try:
+        from bot.google_sheets import (
+            write_local_run_heartbeat, clear_local_run_heartbeat,
+        )
+        write_local_run_heartbeat()
+
+        # Refresh heartbeat every 5 min so it stays fresh for long runs
+        import threading, time as _time_mod
+
+        heartbeat_stop = threading.Event()
+
+        def _heartbeat_loop():
+            while not heartbeat_stop.wait(300):  # every 5 min
+                try:
+                    write_local_run_heartbeat()
+                except Exception:
+                    pass
+
+        heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
+        heartbeat_thread.start()
+        log.info("Local run heartbeat started — Railway scheduler will skip runs")
+    except Exception as e:
+        log.warning("Could not start local run heartbeat (Railway may still schedule runs): %s", e)
+
     # Create driver
     driver = create_driver(cfg["browser"])
 
@@ -241,6 +268,15 @@ def main():
                 input("  Press Enter to quit...")
         log.info("Closing browser")
         driver.quit()
+
+        # Stop heartbeat and clear it
+        if heartbeat_stop is not None:
+            heartbeat_stop.set()
+        try:
+            from bot.google_sheets import clear_local_run_heartbeat
+            clear_local_run_heartbeat()
+        except Exception:
+            pass
 
     log.info("Bot finished")
     print("\n  Done. Check logs/ for details.")

@@ -1265,6 +1265,10 @@ def run(driver: WebDriver, *, dry_run: bool = False, step_through: bool = False,
         log.info("════ Invoice %d/%d (doc %s)%s ════",
                  i + 1, len(all_to_process), row.document_1, pause_label)
 
+        # Mark in-progress (yellow) so user can see activity
+        from bot.google_sheets import _write_todo_status
+        _write_todo_status(row.document_1, "tile3_in_progress", color="yellow")
+
         status = process_row(driver, row, dry_run=dry_run, step_through=step_through)
         log.info("Result: %s", status)
 
@@ -1306,13 +1310,13 @@ def run(driver: WebDriver, *, dry_run: bool = False, step_through: bool = False,
                 # Don't move to Status — leave in To Do with error in col H so it retries next cycle
                 from bot.google_sheets import _write_todo_status
                 _write_todo_status(row.document_1,
-                                   f"tile3_error: {draft_status.replace('error: ', '')[:60]}")
+                                   f"tile3_error: {draft_status.replace('error: ', '')}")
         elif status.startswith("error:"):
             results["errors"] += 1
             # Don't move to Status — leave in To Do for retry
             from bot.google_sheets import _write_todo_status
             _write_todo_status(row.document_1,
-                               f"tile3_error: {status.replace('error: ', '')[:60]}")
+                               f"tile3_error: {status.replace('error: ', '')}")
 
         # Navigate back to Invoice Freight Documents tile for next item
         if i < len(all_to_process) - 1:

@@ -40,7 +40,8 @@ COL_POD_FILENAME = 3 # D
 COL_CHARGE_HRS1 = 4  # E
 COL_CHARGE_HRS2 = 5  # F
 COL_PAUSE = 6        # G
-COL_TODO_STATUS = 7  # H — bot writes: "invoiced", "paused"
+# Col H (7): local run heartbeat timestamp (single cell H1)
+COL_TODO_STATUS = 8  # I — bot writes: "invoiced", "paused", "tile3_in_progress", etc.
 
 
 @dataclass
@@ -97,14 +98,15 @@ class InvoiceRow:
     def pod_filenames(self) -> list[str]:
         """Parse POD_Filename cell into list of filenames with .pdf suffix.
 
-        Supports semicolon-separated multiple files with optional spaces:
+        Supports comma-separated multiple files with optional spaces:
           'VIM04E'              → ['VIM04E.pdf']
-          'VIM04E;VIM04E_2'     → ['VIM04E.pdf', 'VIM04E_2.pdf']
-          'VIM04E; VIM04E_2'    → ['VIM04E.pdf', 'VIM04E_2.pdf']
+          'VIM04E,VIM04E_2'     → ['VIM04E.pdf', 'VIM04E_2.pdf']
+          'VIM04E, VIM04E_2'    → ['VIM04E.pdf', 'VIM04E_2.pdf']
         """
         if not self.pod_filename:
             return []
-        parts = [p.strip() for p in self.pod_filename.split(";")]
+        # Accept both comma and semicolon as delimiters for backwards compat
+        parts = [p.strip() for p in self.pod_filename.replace(";", ",").split(",")]
         return [p + ".pdf" for p in parts if p]
 
 
@@ -156,7 +158,7 @@ def read_todo_items() -> list[InvoiceRow]:
     service = _get_sheets_service()
     result = service.spreadsheets().values().get(
         spreadsheetId=SHEET_ID,
-        range=f"'{TODO_TAB}'!A:H",
+        range=f"'{TODO_TAB}'!A:I",
     ).execute()
 
     rows = result.get("values", [])
@@ -352,26 +354,94 @@ def mark_error(item: InvoiceRow, error_msg: str):
                    processed_at_1=timestamp)
 
 
+def is_local_run_active(max_age_seconds: int = 1800) -> bool:
+    """Check if a local bot run is currently active (by reading a lock cell).
+
+    Local runs write a timestamp to 'To Do'!H2. If that timestamp is fresh
+    (within max_age_seconds), consider a local run active.
+
+    max_age_seconds: how recently the local run must have heartbeat to be
+        considered active. Default 30 min.
+    """
+    service = _get_sheets_service()
+    try:
+        res = service.spreadsheets().values().get(
+            spreadsheetId=SHEET_ID,
+            range=f"'{TODO_TAB}'!H2",
+        ).execute()
+        vals = res.get("values", [])
+        if not vals or not vals[0]:
+            return False
+        ts_str = str(vals[0][0]).strip()
+        if not ts_str:
+            return False
+        from datetime import datetime
+        try:
+            ts = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+            age = (datetime.now() - ts).total_seconds()
+            return age < max_age_seconds
+        except ValueError:
+            return False
+    except Exception as e:
+        log.warning("Could not check local run status: %s", e)
+        return False
+
+
+def write_local_run_heartbeat():
+    """Mark that a local run is active by writing current timestamp to 'To Do'!H2."""
+    service = _get_sheets_service()
+    try:
+        from datetime import datetime
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        service.spreadsheets().values().update(
+            spreadsheetId=SHEET_ID,
+            range=f"'{TODO_TAB}'!H2",
+            valueInputOption="RAW",
+            body={"values": [[ts]]},
+        ).execute()
+        log.info("Wrote local run heartbeat: %s", ts)
+    except Exception as e:
+        log.warning("Could not write local run heartbeat: %s", e)
+
+
+def clear_local_run_heartbeat():
+    """Clear the local run heartbeat cell — called when local run ends."""
+    service = _get_sheets_service()
+    try:
+        service.spreadsheets().values().update(
+            spreadsheetId=SHEET_ID,
+            range=f"'{TODO_TAB}'!H2",
+            valueInputOption="RAW",
+            body={"values": [[""]]},
+        ).execute()
+        log.info("Cleared local run heartbeat")
+    except Exception as e:
+        log.warning("Could not clear local run heartbeat: %s", e)
+
+
 def read_todo_status(document_1: str) -> str:
     """Read the current col H status for a doc from To Do tab."""
     service = _get_sheets_service()
     try:
         doc_col = service.spreadsheets().values().get(
             spreadsheetId=SHEET_ID,
-            range=f"'{TODO_TAB}'!A:H",
+            range=f"'{TODO_TAB}'!A:I",
         ).execute().get("values", [])
         for idx, r in enumerate(doc_col):
             if idx == 0:
                 continue
             if r and str(r[0]).strip() == document_1:
-                return r[7] if len(r) > 7 else ""
+                return r[8] if len(r) > 8 else ""
     except Exception as e:
         log.warning("Could not read To Do status for %s: %s", document_1, e)
     return ""
 
 
-def _write_todo_status(document_1: str, status_text: str):
-    """Write a status value to column H of a row in To Do, matched by Document_1."""
+def _write_todo_status(document_1: str, status_text: str, color: str = "auto"):
+    """Write a status value to column I of a row in To Do.
+
+    color: 'green' | 'red' | 'yellow' | 'auto' (auto picks based on status text)
+    """
     service = _get_sheets_service()
     try:
         result = service.spreadsheets().values().get(
@@ -380,20 +450,74 @@ def _write_todo_status(document_1: str, status_text: str):
         ).execute()
         rows = result.get("values", [])
 
+        target_idx = None
         for idx, r in enumerate(rows):
             if idx == 0:
                 continue
             if r and str(r[0]).strip() == document_1:
-                # Write to column H of this row (1-based row = idx+1)
-                service.spreadsheets().values().update(
-                    spreadsheetId=SHEET_ID,
-                    range=f"'{TODO_TAB}'!H{idx + 1}",
-                    valueInputOption="RAW",
-                    body={"values": [[status_text]]},
-                ).execute()
-                log.info("Set To Do status for doc %s: '%s'", document_1, status_text)
-                return
-        log.warning("Could not find doc %s in To Do to update status", document_1)
+                target_idx = idx
+                break
+
+        if target_idx is None:
+            log.warning("Could not find doc %s in To Do to update status", document_1)
+            return
+
+        # Write the value to col I (status column)
+        service.spreadsheets().values().update(
+            spreadsheetId=SHEET_ID,
+            range=f"'{TODO_TAB}'!I{target_idx + 1}",
+            valueInputOption="RAW",
+            body={"values": [[status_text]]},
+        ).execute()
+        log.info("Set To Do status for doc %s: '%s'", document_1, status_text)
+
+        # Determine color
+        if color == "auto":
+            txt = status_text.lower()
+            if "error" in txt or "failed" in txt:
+                color = "red"
+            elif "in_progress" in txt or "processing" in txt or "running" in txt:
+                color = "yellow"
+            else:
+                color = "green"
+
+        color_rgb = {
+            "green": {"red": 0.0, "green": 0.6, "blue": 0.0},
+            "red":   {"red": 0.8, "green": 0.0, "blue": 0.0},
+            "yellow":{"red": 0.85, "green": 0.65, "blue": 0.0},
+        }.get(color, {"red": 0.0, "green": 0.0, "blue": 0.0})
+
+        # Apply font color (no bold)
+        meta = service.spreadsheets().get(spreadsheetId=SHEET_ID).execute()
+        todo_sheet_id = None
+        for sheet in meta.get("sheets", []):
+            if sheet["properties"]["title"] == TODO_TAB:
+                todo_sheet_id = sheet["properties"]["sheetId"]
+                break
+        if todo_sheet_id is not None:
+            service.spreadsheets().batchUpdate(
+                spreadsheetId=SHEET_ID,
+                body={"requests": [{
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": todo_sheet_id,
+                            "startRowIndex": target_idx,
+                            "endRowIndex": target_idx + 1,
+                            "startColumnIndex": 8,  # I (Status column)
+                            "endColumnIndex": 9,
+                        },
+                        "cell": {
+                            "userEnteredFormat": {
+                                "textFormat": {
+                                    "foregroundColor": color_rgb,
+                                    "bold": False,
+                                }
+                            }
+                        },
+                        "fields": "userEnteredFormat.textFormat",
+                    }
+                }]},
+            ).execute()
     except Exception as e:
         log.error("Error writing To Do status: %s", e)
 
@@ -450,7 +574,7 @@ def sort_paused_rows_to_top():
                         "sheetId": todo_sheet_id,
                         "startRowIndex": 1,  # skip header
                         "startColumnIndex": 0,
-                        "endColumnIndex": 8,  # A through H
+                        "endColumnIndex": 9,  # A through I
                     },
                     "sortSpecs": [{
                         "dimensionIndex": COL_PAUSE,  # col G

@@ -664,6 +664,9 @@ def run(driver: WebDriver, *, dry_run: bool = False, **_kwargs):
         log.info("════ POD Upload %d/%d (doc %s, files %s) ════",
                  i + 1, len(pod_rows), row.document_1, filenames)
 
+        # Mark in-progress (yellow) so user can see activity
+        _write_todo_status(row.document_1, "tile4_in_progress", color="yellow")
+
         # Download all PDFs from Google Drive
         local_paths = []
         download_errors = []
@@ -678,7 +681,7 @@ def run(driver: WebDriver, *, dry_run: bool = False, **_kwargs):
             missing = ", ".join(download_errors)
             log.error("Missing PDFs in Drive: %s", missing)
             # Don't move to Status — this might be temporary (file not uploaded yet)
-            _write_todo_status(row.document_1, f"pod_error: PDFs not in Drive: {missing[:40]}")
+            _write_todo_status(row.document_1, f"pod_error: PDFs not in Drive: {missing}")
             results["errors"] += 1
             for p in local_paths:
                 cleanup_temp_file(p)
@@ -739,7 +742,7 @@ def run(driver: WebDriver, *, dry_run: bool = False, **_kwargs):
                 error_msg = f"doc1: {pod1_status}"
                 if pod2_status:
                     error_msg += f", doc2: {pod2_status}"
-                _write_todo_status(row.document_1, f"pod_error: {error_msg[:60]}")
+                _write_todo_status(row.document_1, f"pod_error: {error_msg}")
 
         finally:
             for p in local_paths:
