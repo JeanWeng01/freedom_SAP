@@ -137,12 +137,14 @@ def filter_by_document(driver: WebDriver, doc_number: str):
 
 
 def click_into_first_row(driver: WebDriver) -> bool:
-    """Click into the first visible row by clicking a non-interactive middle cell.
+    """Click into the first visible row.
 
-    Same approach as tile 2 — click a cell like 'Reporting Status' or similar,
-    NOT the radio button or a link, to navigate into the detail page.
+    Retries finding rows for up to 20s since SAP can take time to render filter results
+    (especially in headless mode).
     """
-    row_el = driver.execute_script("""
+    from selenium.webdriver.support.ui import WebDriverWait
+
+    js_find_row = """
         var rows = document.querySelectorAll(
             '[role="row"].sapMListTblRow, .sapMListItems .sapMLIB, .sapMListTblRow'
         );
@@ -153,10 +155,19 @@ def click_into_first_row(driver: WebDriver) -> bool:
             if (rows[i].textContent.trim().length > 0) dataRows.push(rows[i]);
         }
         return dataRows.length > 0 ? dataRows[0] : null;
-    """)
+    """
+
+    row_el = None
+    try:
+        row_el = WebDriverWait(driver, 20).until(
+            lambda d: d.execute_script(js_find_row)
+        )
+    except Exception:
+        pass
 
     if not row_el:
-        log.error("No data rows found")
+        log.error("No data rows found after 20s wait")
+        take_screenshot(driver, "tile4_no_rows_found")
         return False
 
     # Use native Selenium click on the row element (same as tile 2)
