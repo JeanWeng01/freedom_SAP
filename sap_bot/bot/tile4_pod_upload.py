@@ -32,6 +32,7 @@ from bot.utils import (
 )
 from bot.google_sheets import (
     InvoiceRow, read_todo_items, mark_fully_done, mark_error,
+    _write_todo_status, read_todo_status,
 )
 from bot.google_drive import download_file, cleanup_temp_file
 
@@ -136,7 +137,11 @@ def filter_by_document(driver: WebDriver, doc_number: str):
 
 
 def click_into_first_row(driver: WebDriver) -> bool:
-    """Click into the first visible row by clicking a non-interactive cell."""
+    """Click into the first visible row by clicking a non-interactive middle cell.
+
+    Same approach as tile 2 — click a cell like 'Reporting Status' or similar,
+    NOT the radio button or a link, to navigate into the detail page.
+    """
     row_el = driver.execute_script("""
         var rows = document.querySelectorAll(
             '[role="row"].sapMListTblRow, .sapMListItems .sapMLIB, .sapMListTblRow'
@@ -154,52 +159,146 @@ def click_into_first_row(driver: WebDriver) -> bool:
         log.error("No data rows found")
         return False
 
+    # Use native Selenium click on the row element (same as tile 2)
     try:
         row_el.click()
         log.info("Clicked into first row (native)")
     except Exception:
-        ActionChains(driver).move_to_element(row_el).click().perform()
-        log.info("Clicked into first row (ActionChains)")
+        try:
+            ActionChains(driver).move_to_element(row_el).click().perform()
+            log.info("Clicked into first row (ActionChains)")
+        except Exception as e:
+            log.error("Could not click into row: %s", e)
+            return False
 
     _time.sleep(2)
     wait_for_page_ready(driver)
-    return True
 
-
-def expand_stop_2(driver: WebDriver):
-    """Expand Stop 2 on the detail page."""
-    # Find and click "Stop 2" header or its expand toggle
-    result = driver.execute_script("""
-        var spans = document.querySelectorAll('span, button, a');
+    # Verify navigation happened (check for detail page indicators)
+    on_detail = driver.execute_script("""
+        var spans = document.querySelectorAll('span');
         for (var i = 0; i < spans.length; i++) {
             if (spans[i].offsetParent === null) continue;
             var t = spans[i].textContent.replace(/\\xAD/g, '').trim();
-            if (/^Stop 2/.test(t)) {
-                // Click the expand toggle (usually the parent panel header)
-                var panel = spans[i].closest('[class*="sapMPanel"], [class*="sapUiForm"]');
-                if (panel) {
-                    var toggle = panel.querySelector('[class*="sapMPanelExpandableIcon"], button');
-                    if (toggle) { toggle.click(); return 'toggle'; }
-                }
-                spans[i].click();
-                return 'span';
-            }
-        }
-        // Try "Expand All" button as fallback
-        var links = document.querySelectorAll('a, button');
-        for (var i = 0; i < links.length; i++) {
-            if (links[i].offsetParent === null) continue;
-            var t = links[i].textContent.replace(/\\xAD/g, '').trim();
-            if (t === 'Expand All') { links[i].click(); return 'expand_all'; }
+            if (/^Stop \\d/.test(t)) return 'stop_header';
+            if (t === 'Information' || t === 'Attachments') return 'detail_tab';
         }
         return null;
     """)
-    if result:
-        log.info("Expanded Stop 2 (%s)", result)
-        _time.sleep(1)
+    if on_detail:
+        log.info("Navigation to detail confirmed (%s)", on_detail)
+        return True
+
+    log.warning("Click may not have navigated to detail page")
+    take_screenshot(driver, "tile4_click_no_nav")
+    return True  # proceed anyway — screenshots will show what happened
+
+
+def expand_stop_2(driver: WebDriver):
+    """Expand Stop 2 on the detail page.
+
+    First scrolls down to force SAP to render all content, then clicks Expand All
+    or the Stop 2 header.
+    """
+    # Scroll down to ensure stops are rendered (may be below the fold)
+    driver.execute_script("""
+        // Scroll page and any scrollable containers to bottom
+        window.scrollTo(0, document.body.scrollHeight);
+        var containers = document.querySelectorAll('.sapMPage, .sapMScrollContainer, [class*="Scroll"]');
+        for (var i = 0; i < containers.length; i++) {
+            containers[i].scrollTop = containers[i].scrollHeight;
+        }
+    """)
+    _time.sleep(2)
+
+    # Try Expand All first (expands all stops including Stop 2)
+    expanded = driver.execute_script("""
+        var links = document.querySelectorAll('a, button, span');
+        for (var i = 0; i < links.length; i++) {
+            if (links[i].offsetParent === null) continue;
+            var t = links[i].textContent.replace(/\\xAD/g, '').trim();
+            if (t === 'Expand All') {
+                links[i].click();
+                return 'expand_all_link';
+            }
+        }
+        return null;
+    """)
+
+    if expanded:
+        log.info("Clicked Expand All")
+        _time.sleep(2)
         wait_for_page_ready(driver)
+
+    # After Expand All (or as a fallback), explicitly click Stop 2 header to expand it.
+    # "Expand All" often only expands the top-level sections, not nested ones.
+    stop2_header = driver.execute_script("""
+        var all = document.querySelectorAll('span, div, a, button');
+        for (var i = 0; i < all.length; i++) {
+            if (all[i].offsetParent === null) continue;
+            var t = all[i].textContent.replace(/\\xAD/g, '').trim();
+            if (/^Stop 2/.test(t) && t.length < 150) {
+                // Prefer the closest panel/section header element
+                var header = all[i].closest('[role="button"], [aria-expanded]');
+                return header || all[i];
+            }
+        }
+        return null;
+    """)
+
+    if stop2_header:
+        # Scroll into view first
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", stop2_header)
+        _time.sleep(0.5)
+
+        # Check if Stop 2 is already expanded
+        is_expanded = driver.execute_script("""
+            var el = arguments[0];
+            return el.getAttribute('aria-expanded') === 'true';
+        """, stop2_header)
+
+        if not is_expanded:
+            # Click to expand — try native click, then ActionChains
+            try:
+                stop2_header.click()
+                log.info("Clicked Stop 2 header (native)")
+            except Exception:
+                try:
+                    ActionChains(driver).move_to_element(stop2_header).click().perform()
+                    log.info("Clicked Stop 2 header (ActionChains)")
+                except Exception as e:
+                    log.warning("Could not click Stop 2 header: %s", e)
+                    driver.execute_script("arguments[0].click();", stop2_header)
+                    log.info("Clicked Stop 2 header (JS)")
+            _time.sleep(2)
+            wait_for_page_ready(driver)
+        else:
+            log.info("Stop 2 already expanded")
     else:
-        log.warning("Could not find Stop 2 to expand — may already be expanded")
+        log.warning("Could not find Stop 2 header")
+
+    # Scroll Stop 2 area into view so Proof of Delivery is visible
+    driver.execute_script("""
+        var all = document.querySelectorAll('span, div');
+        for (var i = 0; i < all.length; i++) {
+            if (all[i].offsetParent === null) continue;
+            var t = all[i].textContent.replace(/\\xAD/g, '').trim();
+            if (t.indexOf('Proof of Delivery') !== -1) {
+                all[i].scrollIntoView({block: 'center'});
+                return;
+            }
+        }
+        // Fallback: scroll to Stop 2 header
+        for (var i = 0; i < all.length; i++) {
+            if (all[i].offsetParent === null) continue;
+            var t = all[i].textContent.replace(/\\xAD/g, '').trim();
+            if (/^Stop 2/.test(t) && t.length < 150) {
+                all[i].scrollIntoView({block: 'center'});
+                return;
+            }
+        }
+    """)
+    _time.sleep(1)
 
 
 def find_proof_of_delivery_report_btn(driver: WebDriver):
@@ -275,39 +374,94 @@ def read_planned_time_from_popup(driver: WebDriver) -> str | None:
     return stripped
 
 
-@destructive_action("Upload POD and report for {doc_number}")
-def upload_and_report(driver: WebDriver, local_paths: list, *, doc_number: str = ""):
+def upload_and_report(driver: WebDriver, local_paths: list, *, doc_number: str = "",
+                      dry_run: bool = False):
     """In the Report popup: fill time, upload PDF(s), click Report.
 
-    local_paths: list of local file paths to upload (supports multiple files).
+    Fills the form regardless of dry_run so you can see the result visually.
+    Only the final Report button click is guarded by dry_run.
     """
     take_screenshot(driver, f"tile4_popup_{doc_number}")
 
     # Read Planned On time from popup
     planned_time = read_planned_time_from_popup(driver)
 
-    # Fill the time into the reporting field
+    # Fill the time into the "Enter Final Time" field
     if planned_time:
         time_input = driver.execute_script("""
             var dialogs = document.querySelectorAll('[class*="sapMDialog"], [role="dialog"]');
             for (var i = dialogs.length - 1; i >= 0; i--) {
                 var d = dialogs[i];
                 if (d.offsetParent === null) continue;
+
+                // Strategy 1: Find input with placeholder "Enter Final Time"
                 var inputs = d.querySelectorAll('input:not([type="hidden"]):not([type="file"])');
                 for (var j = 0; j < inputs.length; j++) {
-                    if (inputs[j].offsetParent !== null) return inputs[j];
+                    if (inputs[j].offsetParent === null) continue;
+                    var ph = inputs[j].placeholder || '';
+                    var al = inputs[j].getAttribute('aria-label') || '';
+                    if (ph.indexOf('Final Time') !== -1 || al.indexOf('Final Time') !== -1) {
+                        return inputs[j];
+                    }
+                }
+
+                // Strategy 2: Find input that's NOT the reason code / timezone
+                for (var j = 0; j < inputs.length; j++) {
+                    if (inputs[j].offsetParent === null) continue;
+                    var ph = (inputs[j].placeholder || '').toLowerCase();
+                    var al = (inputs[j].getAttribute('aria-label') || '').toLowerCase();
+                    // Skip reason and timezone inputs
+                    if (ph.indexOf('reason') !== -1 || al.indexOf('reason') !== -1) continue;
+                    if (ph.indexOf('timezone') !== -1 || al.indexOf('timezone') !== -1) continue;
+                    if (ph.indexOf('est') !== -1 || al.indexOf('est') !== -1) continue;
+                    // Return the first remaining input (likely the Final Time)
+                    return inputs[j];
                 }
             }
             return null;
         """)
         if time_input:
-            time_input.click()
-            _time.sleep(0.3)
-            time_input.clear()
-            time_input.send_keys(planned_time)
-            log.info("Entered time: '%s'", planned_time)
+            # Use focus + clear + send_keys (click can be intercepted by overlays)
+            try:
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", time_input)
+                _time.sleep(0.3)
+                driver.execute_script("arguments[0].focus();", time_input)
+                _time.sleep(0.3)
+                time_input.clear()
+                time_input.send_keys(planned_time)
+                log.info("Entered Final Time: '%s'", planned_time)
+            except Exception as e:
+                log.warning("Could not enter time with send_keys: %s — trying JS", e)
+                driver.execute_script("""
+                    var el = arguments[0];
+                    el.value = arguments[1];
+                    el.dispatchEvent(new Event('input', {bubbles: true}));
+                    el.dispatchEvent(new Event('change', {bubbles: true}));
+                """, time_input, planned_time)
+                log.info("Entered Final Time via JS: '%s'", planned_time)
         else:
-            log.warning("Time input not found in popup")
+            log.warning("'Enter Final Time' input not found in popup")
+            # Debug: dump popup inputs
+            debug = driver.execute_script("""
+                var dialogs = document.querySelectorAll('[class*="sapMDialog"], [role="dialog"]');
+                var results = [];
+                for (var i = dialogs.length - 1; i >= 0; i--) {
+                    var d = dialogs[i];
+                    if (d.offsetParent === null) continue;
+                    var inputs = d.querySelectorAll('input:not([type="hidden"])');
+                    for (var j = 0; j < inputs.length; j++) {
+                        if (inputs[j].offsetParent === null) continue;
+                        results.push({
+                            placeholder: inputs[j].placeholder,
+                            ariaLabel: inputs[j].getAttribute('aria-label'),
+                            type: inputs[j].type,
+                            value: inputs[j].value
+                        });
+                    }
+                }
+                return results;
+            """)
+            log.info("DEBUG popup inputs: %s", debug)
 
     # Upload each PDF via Browse
     # SAP's file input usually accepts one file at a time, but we can send
@@ -369,6 +523,23 @@ def upload_and_report(driver: WebDriver, local_paths: list, *, doc_number: str =
         return null;
     """)
     if btn:
+        if dry_run:
+            log.info("[DRY RUN] Would click Report button in popup — skipping")
+            # Cancel the popup instead so the page isn't stuck
+            driver.execute_script("""
+                var dialogs = document.querySelectorAll('[class*="sapMDialog"], [role="dialog"]');
+                for (var i = dialogs.length - 1; i >= 0; i--) {
+                    var d = dialogs[i];
+                    if (d.offsetParent === null) continue;
+                    var btns = d.querySelectorAll('button');
+                    for (var j = 0; j < btns.length; j++) {
+                        var t = btns[j].textContent.replace(/\\xAD/g, '').trim();
+                        if (t === 'Cancel' || t === 'Close') { btns[j].click(); return; }
+                    }
+                }
+            """)
+            _time.sleep(1)
+            return None  # dry run result
         try:
             btn.click()
             log.info("Clicked Report in popup (native)")
@@ -476,8 +647,8 @@ def run(driver: WebDriver, *, dry_run: bool = False, **_kwargs):
         log.info("No items in To Do tab — nothing to upload")
         return {"uploaded": 0, "errors": 0}
 
-    # Filter to rows with POD filename and not paused
-    pod_rows = [r for r in rows if r.pod_filename and not r.pause]
+    # Filter to rows with POD filename — Pause flag only affects tile 3, not tile 4
+    pod_rows = [r for r in rows if r.pod_filename]
     if not pod_rows:
         log.info("No active rows with POD_Filename — nothing to upload")
         return {"uploaded": 0, "errors": 0}
@@ -547,10 +718,17 @@ def run(driver: WebDriver, *, dry_run: bool = False, **_kwargs):
                 log.info("Doc 2 (%s) result: %s", row.document_2, status2)
                 pod2_status = "done" if status2 == "done" else status2
 
-            # Move to Status tab if both uploads succeeded
             if status1 == "done" and (not row.is_collective or pod2_status == "done"):
                 results["uploaded"] += 1
-                mark_fully_done(row, pod_uploaded_1=pod1_status, pod_uploaded_2=pod2_status)
+                current_status = read_todo_status(row.document_1)
+
+                if "invoiced" in current_status.lower():
+                    log.info("Both tile 3 (invoiced) and tile 4 (pod uploaded) done — moving to Status")
+                    mark_fully_done(row, pod_uploaded_1=pod1_status, pod_uploaded_2=pod2_status)
+                else:
+                    log.info("POD uploaded but tile 3 not done yet — marking in To Do")
+                    _write_todo_status(row.document_1, "pod_uploaded")
+
             elif status1 == "dry_run":
                 results["skipped"] += 1
             else:
@@ -558,7 +736,7 @@ def run(driver: WebDriver, *, dry_run: bool = False, **_kwargs):
                 error_msg = f"doc1: {pod1_status}"
                 if pod2_status:
                     error_msg += f", doc2: {pod2_status}"
-                mark_error(row, error_msg)
+                _write_todo_status(row.document_1, f"pod_error: {error_msg[:60]}")
 
         finally:
             for p in local_paths:

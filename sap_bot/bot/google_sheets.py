@@ -352,6 +352,24 @@ def mark_error(item: InvoiceRow, error_msg: str):
                    processed_at_1=timestamp)
 
 
+def read_todo_status(document_1: str) -> str:
+    """Read the current col H status for a doc from To Do tab."""
+    service = _get_sheets_service()
+    try:
+        doc_col = service.spreadsheets().values().get(
+            spreadsheetId=SHEET_ID,
+            range=f"'{TODO_TAB}'!A:H",
+        ).execute().get("values", [])
+        for idx, r in enumerate(doc_col):
+            if idx == 0:
+                continue
+            if r and str(r[0]).strip() == document_1:
+                return r[7] if len(r) > 7 else ""
+    except Exception as e:
+        log.warning("Could not read To Do status for %s: %s", document_1, e)
+    return ""
+
+
 def _write_todo_status(document_1: str, status_text: str):
     """Write a status value to column H of a row in To Do, matched by Document_1."""
     service = _get_sheets_service()

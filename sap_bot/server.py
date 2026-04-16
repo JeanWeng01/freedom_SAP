@@ -250,8 +250,12 @@ def _parse_run_times(spec: str) -> list[tuple[int, int]]:
 TILE12_RUN_TIMES = _parse_run_times(os.environ.get("TILE12_RUN_HOURS", "9:00,12:00,15:00"))
 
 # Tiles 3 & 4: disabled by default, enable via env var ENABLE_TILES_34=true
+# Default: every hour 9am-2am (9,10,...,23,0,1,2)
 TILES_34_ENABLED = os.environ.get("ENABLE_TILES_34", "false").lower() == "true"
-TILE34_INTERVAL_MINUTES = int(os.environ.get("TILE34_INTERVAL_MINUTES", "180"))
+TILE34_RUN_TIMES = _parse_run_times(os.environ.get(
+    "TILE34_RUN_HOURS",
+    "9:00,10:00,11:00,12:00,13:00,14:00,15:00,16:00,17:00,18:00,19:00,20:00,21:00,22:00,23:00,0:00,1:00,2:00"
+))
 
 
 def scheduler_loop_12():
@@ -292,27 +296,32 @@ def scheduler_loop_12():
 
 
 def scheduler_loop_34():
-    """Run tiles 3 & 4 every N hours during daytime (not 4am-9am). Disabled by default."""
+    """Run tiles 3 & 4 at specific HH:MM times. Disabled by default."""
     import time
 
     if not TILES_34_ENABLED:
         log.info("Tiles 3 & 4 scheduler DISABLED (set ENABLE_TILES_34=true to enable)")
-        return  # exit thread entirely
+        return
 
-    interval = TILE34_INTERVAL_MINUTES * 60
-    log.info("Tiles 3 & 4 scheduler started — every %d min during daytime (not 4am-9am)",
-             TILE34_INTERVAL_MINUTES)
+    times_str = ", ".join(f"{h:02d}:{m:02d}" for h, m in TILE34_RUN_TIMES)
+    log.info("Tiles 3 & 4 scheduler started — runs at: %s", times_str)
+
+    already_ran = None
 
     while True:
-        if is_in_invoice_window():
-            try:
-                run_auto_cycle_34()
-            except Exception as e:
-                log.error("Tiles 3 & 4 auto cycle error: %s", e, exc_info=True)
-        else:
-            log.debug("Outside daytime window — skipping tiles 3 & 4")
+        now = datetime.now()
+        current_key = (now.year, now.month, now.day, now.hour, now.minute)
 
-        time.sleep(interval)
+        for hr, mn in TILE34_RUN_TIMES:
+            if now.hour == hr and now.minute == mn and already_ran != current_key:
+                already_ran = current_key
+                try:
+                    run_auto_cycle_34()
+                except Exception as e:
+                    log.error("Tiles 3 & 4 auto cycle error: %s", e, exc_info=True)
+                break
+
+        time.sleep(30)
 
 
 # ── Flask app ───────────────────────────────────────────────────────────────

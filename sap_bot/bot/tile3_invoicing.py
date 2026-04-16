@@ -20,7 +20,8 @@ from bot.utils import (
 )
 from bot.google_sheets import (
     InvoiceRow, read_todo_items, mark_tile3_done, mark_tile3_done_with_note,
-    mark_tile3_paused, mark_error, sort_paused_rows_to_top,
+    mark_tile3_paused, mark_error, mark_fully_done, sort_paused_rows_to_top,
+    read_todo_status,
 )
 
 log = logging.getLogger(__name__)
@@ -1251,11 +1252,18 @@ def run(driver: WebDriver, *, dry_run: bool = False, step_through: bool = False,
 
         if status == "submitted":
             results["submitted"] += 1
-            note = getattr(row, '_skipped_note', '')
-            if note:
-                mark_tile3_done_with_note(row, note)
+            # Check if tile 4 already ran (col H = "pod_uploaded")
+            current_status = read_todo_status(row.document_1)
+            if "pod_uploaded" in current_status.lower():
+                log.info("Both tile 3 and tile 4 done — moving to Status")
+                mark_fully_done(row, pod_uploaded_1="done",
+                                pod_uploaded_2="done" if row.is_collective else "")
             else:
-                mark_tile3_done(row)  # stays in To Do for tile 4
+                note = getattr(row, '_skipped_note', '')
+                if note:
+                    mark_tile3_done_with_note(row, note)
+                else:
+                    mark_tile3_done(row)  # stays in To Do for tile 4
         elif status == "paused":
             results["paused"] += 1
             mark_tile3_paused(row)
