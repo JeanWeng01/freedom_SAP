@@ -187,6 +187,24 @@ def click_all_tab_tile3(driver: WebDriver):
 
     The tabs are in an icon tab bar. The 'All' tab label looks like 'All (2)'.
     """
+    take_screenshot(driver, "tile3_before_all_tab_search")
+
+    # Dump tab area for headless debugging
+    tab_debug = driver.execute_script("""
+        var tabs = document.querySelectorAll('[role="tab"], .sapMITBFilter, .sapMITBItem');
+        var results = [];
+        for (var i = 0; i < tabs.length; i++) {
+            results.push({
+                text: tabs[i].textContent.replace(/\\xAD/g, '').replace(/\\s+/g, ' ').trim().substring(0, 60),
+                visible: tabs[i].offsetParent !== null,
+                role: tabs[i].getAttribute('role'),
+                className: tabs[i].className.substring(0, 50)
+            });
+        }
+        return results;
+    """)
+    log.info("DEBUG tab elements: %s", tab_debug)
+
     # Wait for the page to settle and tab content to render (esp. important in headless)
     _time.sleep(2)
     wait_for_page_ready(driver)
