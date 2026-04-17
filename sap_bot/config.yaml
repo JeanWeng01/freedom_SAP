@@ -10,5 +10,5 @@ dry_run: false                    # SAFETY: if true, bot navigates but never cli
 step_through: false
 
 # Screenshot settings
-screenshot_on_action: true       # take screenshot before/after destructive actions
+screenshot_on_action: false       # take screenshot before/after destructive actions
 screenshot_on_error: true        # take screenshot on any error

@@ -446,38 +446,52 @@ def read_todo_status(document_1: str) -> str:
 
 
 def _write_todo_status(document_1: str, status_text: str, color: str = "auto"):
-    """Write a status value to column I of a row in To Do.
+    """Append a status value to column J of a row in To Do.
+
+    Appends with '; ' separator so history is preserved:
+      'invoiced' → 'invoiced; pod_uploaded' → 'invoiced; pod_uploaded; tile3_error: ...'
 
     color: 'green' | 'red' | 'yellow' | 'auto' (auto picks based on status text)
     """
     service = _get_sheets_service()
     try:
+        # Read both col A (to find row) and col J (current status)
         result = service.spreadsheets().values().get(
             spreadsheetId=SHEET_ID,
-            range=f"'{TODO_TAB}'!A:A",
+            range=f"'{TODO_TAB}'!A:J",
         ).execute()
         rows = result.get("values", [])
 
         target_idx = None
+        current_status = ""
         for idx, r in enumerate(rows):
             if idx == 0:
                 continue
             if r and str(r[0]).strip() == document_1:
                 target_idx = idx
+                current_status = r[9] if len(r) > 9 else ""
                 break
 
         if target_idx is None:
             log.warning("Could not find doc %s in To Do to update status", document_1)
             return
 
-        # Write the value to col I (status column)
+        # Append new status (don't duplicate if already present)
+        if current_status and status_text not in current_status:
+            new_status = f"{current_status}; {status_text}"
+        elif not current_status:
+            new_status = status_text
+        else:
+            new_status = current_status  # already contains this status
+
+        # Write the appended value to col J
         service.spreadsheets().values().update(
             spreadsheetId=SHEET_ID,
             range=f"'{TODO_TAB}'!J{target_idx + 1}",
             valueInputOption="RAW",
-            body={"values": [[status_text]]},
+            body={"values": [[new_status]]},
         ).execute()
-        log.info("Set To Do status for doc %s: '%s'", document_1, status_text)
+        log.info("Set To Do status for doc %s: '%s'", document_1, new_status)
 
         # Determine color
         if color == "auto":

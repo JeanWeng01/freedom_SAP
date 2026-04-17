@@ -24,12 +24,15 @@ if not HEADLESS:
 # Screenshot helpers
 # ---------------------------------------------------------------------------
 
+SCREENSHOTS_ENABLED = os.environ.get("SCREENSHOT_ON_ACTION", "true").lower() == "true"
+
+
 def take_screenshot(driver: WebDriver, label: str = "") -> str:
     """Save a timestamped screenshot and return the file path.
 
-    Skipped entirely in headless mode (Railway) to save storage.
+    Skipped in headless mode (Railway) or when screenshot_on_action is false in config.
     """
-    if HEADLESS:
+    if HEADLESS or not SCREENSHOTS_ENABLED:
         return ""
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_label = label.replace(" ", "_").replace("/", "-")[:60]

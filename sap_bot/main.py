@@ -111,6 +111,11 @@ def run_tiles(driver, cfg: dict, tiles: list[int]):
     dry_run = cfg.get("dry_run", True)
     step_through = cfg.get("step_through", False)
 
+    # Wire screenshot config to the utils module
+    import bot.utils
+    if not cfg.get("screenshot_on_action", True):
+        bot.utils.SCREENSHOTS_ENABLED = False
+
     if dry_run:
         print("\n  *** DRY RUN MODE — no destructive actions will be taken ***\n")
         log.info("DRY RUN MODE enabled")

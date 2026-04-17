@@ -190,63 +190,44 @@ def click_all_tab_tile3(driver: WebDriver):
     take_screenshot(driver, "tile3_before_all_tab_search")
 
     # Wait for tile-specific tab bar to render (NOT the SAP shell tabs)
-    # The tile's tabs contain "To be Invoiced" or "Invoicing in Process" — wait for those
+    # Look for ANY text containing "Invoic" (matches "To be Invoiced", "Invoicing in Process",
+    # "Completely Invoiced" etc.) — handles soft hyphens and partial rendering
     from selenium.webdriver.support.ui import WebDriverWait as _WDW
     try:
         _WDW(driver, 30).until(
             lambda d: d.execute_script("""
-                var all = document.querySelectorAll('.sapMITBFilter, .sapMITBItem, span, div');
-                for (var i = 0; i < all.length; i++) {
-                    var t = all[i].textContent.replace(/\\xAD/g, '').replace(/\\s+/g, ' ').trim();
-                    if (t.indexOf('To be Invoiced') !== -1 || t.indexOf('Invoicing in Process') !== -1) {
-                        return true;
-                    }
-                }
+                // Check page text for any invoice-related tab content
+                var body = document.body ? document.body.textContent : '';
+                body = body.replace(/\\xAD/g, '');
+                if (body.indexOf('Invoiced') !== -1 || body.indexOf('Invoicing') !== -1) return true;
+                // Also check for the "All (" pattern which appears in the tab bar
+                if (/All\\s*\\(\\d/.test(body)) return true;
                 return false;
             """)
         )
-        log.info("Tile tab bar rendered (found 'To be Invoiced' or 'Invoicing in Process')")
+        log.info("Tile tab bar content detected")
     except Exception:
-        log.warning("Tile tab bar not found after 30s — proceeding anyway")
+        log.warning("Tile tab bar text not found after 30s — will try anyway")
 
-    # Find the All tab — look specifically within the tabs that include "Invoiced" sibling tabs
+    # Find the All tab element
+    # Strategy: search the entire DOM for clickable elements whose clean text matches "All (N)"
+    # Exclude SAP shell tabs (class sapUshellAnchorItem) which are the top navigation
     from selenium.webdriver.support.ui import WebDriverWait
     all_tab = None
     js_finder = """
-        // Find the tab bar that contains "To be Invoiced" — that's where the "All" tab lives
-        // Strategy: find the element containing "To be Invoiced" text, then look for a sibling "All (N)" tab
-        var invoiceMarkers = document.querySelectorAll('[role="tab"], .sapMITBFilter, .sapMITBItem');
-        var tabBar = null;
-        for (var i = 0; i < invoiceMarkers.length; i++) {
-            var t = invoiceMarkers[i].textContent.replace(/\\xAD/g, '').replace(/\\s+/g, ' ').trim();
-            if (t.indexOf('To be Invoiced') !== -1 || t.indexOf('Invoicing in Process') !== -1) {
-                // Walk up to find the common tab container
-                tabBar = invoiceMarkers[i].closest('[class*="sapMITBHeader"], [class*="sapMITBContainer"], [role="tablist"]');
-                if (!tabBar) tabBar = invoiceMarkers[i].parentElement;
-                break;
+        // Search ALL elements, exclude SAP shell tabs
+        var all = document.querySelectorAll('*');
+        for (var i = 0; i < all.length; i++) {
+            // Skip shell navigation tabs
+            if (all[i].className && all[i].className.indexOf('sapUshellAnchor') !== -1) continue;
+            var t = all[i].textContent.replace(/\\xAD/g, '').replace(/\\s+/g, ' ').trim();
+            // Match "All (N)" — but only if it's a SHORT text (not a parent containing lots of text)
+            if (/^All\\s*\\(\\d+\\)$/.test(t) && t.length < 15) {
+                // Prefer clicking the closest ITB element or the element itself
+                var clickable = all[i].closest('.sapMITBFilter, .sapMITBItem');
+                return clickable || all[i];
             }
         }
-
-        if (tabBar) {
-            // Look for "All (N)" tab within this bar's siblings
-            var tabsInBar = tabBar.querySelectorAll('[role="tab"], .sapMITBFilter, .sapMITBItem');
-            for (var i = 0; i < tabsInBar.length; i++) {
-                var t = tabsInBar[i].textContent.replace(/\\xAD/g, '').replace(/\\s+/g, ' ').trim();
-                if (/^All\\s*\\(\\d+\\)$/.test(t) || /^All\\s*\\(\\d/.test(t)) {
-                    return tabsInBar[i];
-                }
-            }
-        }
-
-        // Fallback: any tab-role element with "All (N)" pattern
-        var allTabs = document.querySelectorAll('[role="tab"], .sapMITBFilter, .sapMITBItem');
-        for (var i = 0; i < allTabs.length; i++) {
-            var t = allTabs[i].textContent.replace(/\\xAD/g, '').replace(/\\s+/g, ' ').trim();
-            if (/^All\\s*\\(\\d+\\)$/.test(t)) {
-                return allTabs[i];
-            }
-        }
-
         return null;
     """
     try:
@@ -257,12 +238,24 @@ def click_all_tab_tile3(driver: WebDriver):
         pass
 
     if not all_tab:
-        log.warning("'All' tab not found after waiting")
+        # Debug: dump what text fragments exist that contain "All"
+        debug = driver.execute_script("""
+            var results = [];
+            var all = document.querySelectorAll('*');
+            for (var i = 0; i < all.length; i++) {
+                if (all[i].className && all[i].className.indexOf('sapUshellAnchor') !== -1) continue;
+                var t = all[i].textContent.replace(/\\xAD/g, '').replace(/\\s+/g, ' ').trim();
+                if (/^All/.test(t) && t.length < 20) {
+                    results.push({text: t, tag: all[i].tagName, cls: (all[i].className || '').substring(0,40)});
+                }
+            }
+            return results.slice(0, 15);
+        """)
+        log.warning("'All' tab not found. Elements starting with 'All': %s", debug)
         take_screenshot(driver, "tile3_all_tab_not_found")
         return False
 
-    # Log which element we actually found (for debugging)
-    log.info("Found 'All' tab element with text: %s",
+    log.info("Found 'All' tab: %s",
              driver.execute_script("return arguments[0].textContent.replace(/\\xAD/g,'').replace(/\\s+/g,' ').trim().substring(0, 50);", all_tab))
 
     # Native click — JS click doesn't trigger SAP UI5 tab switch
