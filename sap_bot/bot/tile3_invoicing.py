@@ -189,25 +189,25 @@ def click_all_tab_tile3(driver: WebDriver):
     """
     take_screenshot(driver, "tile3_before_all_tab_search")
 
-    # Dump tab area for headless debugging
-    tab_debug = driver.execute_script("""
-        var tabs = document.querySelectorAll('[role="tab"], .sapMITBFilter, .sapMITBItem');
-        var results = [];
-        for (var i = 0; i < tabs.length; i++) {
-            results.push({
-                text: tabs[i].textContent.replace(/\\xAD/g, '').replace(/\\s+/g, ' ').trim().substring(0, 60),
-                visible: tabs[i].offsetParent !== null,
-                role: tabs[i].getAttribute('role'),
-                className: tabs[i].className.substring(0, 50)
-            });
-        }
-        return results;
-    """)
-    log.info("DEBUG tab elements: %s", tab_debug)
-
-    # Wait for the page to settle and tab content to render (esp. important in headless)
-    _time.sleep(2)
-    wait_for_page_ready(driver)
+    # Wait for tile-specific tab bar to render (NOT the SAP shell tabs)
+    # The tile's tabs contain "To be Invoiced" or "Invoicing in Process" — wait for those
+    from selenium.webdriver.support.ui import WebDriverWait as _WDW
+    try:
+        _WDW(driver, 30).until(
+            lambda d: d.execute_script("""
+                var all = document.querySelectorAll('.sapMITBFilter, .sapMITBItem, span, div');
+                for (var i = 0; i < all.length; i++) {
+                    var t = all[i].textContent.replace(/\\xAD/g, '').replace(/\\s+/g, ' ').trim();
+                    if (t.indexOf('To be Invoiced') !== -1 || t.indexOf('Invoicing in Process') !== -1) {
+                        return true;
+                    }
+                }
+                return false;
+            """)
+        )
+        log.info("Tile tab bar rendered (found 'To be Invoiced' or 'Invoicing in Process')")
+    except Exception:
+        log.warning("Tile tab bar not found after 30s — proceeding anyway")
 
     # Find the All tab — look specifically within the tabs that include "Invoiced" sibling tabs
     from selenium.webdriver.support.ui import WebDriverWait
