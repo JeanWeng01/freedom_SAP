@@ -34,22 +34,25 @@ BACK_BUTTON = (By.CSS_SELECTOR,
 
 
 def navigate_to_tile(driver: WebDriver):
-    """Click the Invoice Freight Documents tile and wait for it to load."""
+    """Click the Invoice Freight Documents tile and wait for it to actually load.
+
+    Uses body text check (not offsetParent) for headless compatibility.
+    """
     click_tile(driver, TILE_NAME)
     from selenium.webdriver.support.ui import WebDriverWait
     try:
         WebDriverWait(driver, 30).until(
             lambda d: d.execute_script("""
-                var spans = document.querySelectorAll('span');
-                for (var i = 0; i < spans.length; i++) {
-                    if (spans[i].offsetParent === null) continue;
-                    var t = spans[i].textContent.replace(/\\xAD/g, '').trim();
-                    if (/Freight Documents \\(/.test(t)) return true;
-                    if (t === 'To be Invoiced' || t === 'To Be Invoiced') return true;
-                }
+                var body = document.body ? document.body.textContent.replace(/\\xAD/g, '') : '';
+                // Look for text unique to the Invoice Freight Documents tile
+                if (body.indexOf('Freight Document') !== -1 && body.indexOf('Invoice') !== -1) return true;
+                if (body.indexOf('To be Invoiced') !== -1) return true;
+                if (body.indexOf('Invoicing in Process') !== -1) return true;
+                if (body.indexOf('Create Invoice') !== -1) return true;
                 return false;
             """)
         )
+        log.info("Tile 3 page content detected in body text")
     except TimeoutException:
         log.warning("Tile 3 page content not detected after 30s — retrying")
         import os
@@ -58,7 +61,7 @@ def navigate_to_tile(driver: WebDriver):
             driver.get(launchpad_url)
             wait_for_page_ready(driver)
         click_tile(driver, TILE_NAME)
-        _time.sleep(10)
+        _time.sleep(15)
     wait_for_page_ready(driver)
     take_screenshot(driver, "tile3_page_loaded")
     log.info("Tile 3 page loaded")
@@ -218,8 +221,9 @@ def click_all_tab_tile3(driver: WebDriver):
         // Search ALL elements, exclude SAP shell tabs
         var all = document.querySelectorAll('*');
         for (var i = 0; i < all.length; i++) {
-            // Skip shell navigation tabs
-            if (all[i].className && all[i].className.indexOf('sapUshellAnchor') !== -1) continue;
+            // Skip shell navigation tabs (handle SVG elements where className isn't a string)
+            var cls = (typeof all[i].className === 'string') ? all[i].className : '';
+            if (cls.indexOf('sapUshellAnchor') !== -1) continue;
             var t = all[i].textContent.replace(/\\xAD/g, '').replace(/\\s+/g, ' ').trim();
             // Match "All (N)" — but only if it's a SHORT text (not a parent containing lots of text)
             if (/^All\\s*\\(\\d+\\)$/.test(t) && t.length < 15) {
@@ -243,7 +247,8 @@ def click_all_tab_tile3(driver: WebDriver):
             var results = [];
             var all = document.querySelectorAll('*');
             for (var i = 0; i < all.length; i++) {
-                if (all[i].className && all[i].className.indexOf('sapUshellAnchor') !== -1) continue;
+                var cls2 = (typeof all[i].className === 'string') ? all[i].className : '';
+                if (cls2.indexOf('sapUshellAnchor') !== -1) continue;
                 var t = all[i].textContent.replace(/\\xAD/g, '').replace(/\\s+/g, ' ').trim();
                 if (/^All/.test(t) && t.length < 20) {
                     results.push({text: t, tag: all[i].tagName, cls: (all[i].className || '').substring(0,40)});
