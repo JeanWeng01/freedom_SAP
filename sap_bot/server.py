@@ -77,7 +77,40 @@ run_status = {
     "last_auto_run": None,
     "next_auto_run": None,
     "last_invoice_run": None,
+    # Daily totals reset at midnight (server local time). Counts items processed today.
+    "daily_totals": {
+        "date": "",
+        "tile1_new_confirmed": 0,
+        "tile1_updated_confirmed": 0,
+        "tile1_total_confirmed": 0,
+        "tile2_stops_reported": 0,
+    },
 }
+
+
+def _update_daily_totals(tile_num: int, result: dict):
+    """Add a successful run's counts to the daily running totals.
+
+    Resets all counters when the calendar date rolls over.
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    dt = run_status["daily_totals"]
+    if dt["date"] != today:
+        dt["date"] = today
+        dt["tile1_new_confirmed"] = 0
+        dt["tile1_updated_confirmed"] = 0
+        dt["tile1_total_confirmed"] = 0
+        dt["tile2_stops_reported"] = 0
+
+    if result.get("status") != "completed":
+        return
+
+    if tile_num == 1:
+        dt["tile1_new_confirmed"] += result.get("new_confirmed", 0) or 0
+        dt["tile1_updated_confirmed"] += result.get("updated_confirmed", 0) or 0
+        dt["tile1_total_confirmed"] += result.get("total_confirmed", 0) or 0
+    elif tile_num == 2:
+        dt["tile2_stops_reported"] += result.get("stops_reported", 0) or 0
 
 
 def run_tile(tile_num: int, dry_run: bool = False) -> dict:
@@ -174,6 +207,7 @@ def run_tile(tile_num: int, dry_run: bool = False) -> dict:
             run_status[tile_key]["running"] = False
             run_status[tile_key]["last_run"] = datetime.now().isoformat()
             run_status[tile_key]["result"] = result
+            _update_daily_totals(tile_num, result)
 
         return result
 
