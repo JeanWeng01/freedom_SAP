@@ -9,6 +9,10 @@ sap_bot/screenshots/
 
 # Logs
 sap_bot/logs/
+logs.*.log
+
+# Local scratch files
+tiles_3_and_4.txt
 
 # Python
 __pycache__/
