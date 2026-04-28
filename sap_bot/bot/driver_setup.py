@@ -10,6 +10,10 @@ log = logging.getLogger(__name__)
 
 HEADLESS = os.environ.get("HEADLESS", "false").lower() == "true"
 
+# Path to chromedriver baked into the Docker image. Falls back to Selenium Manager
+# (auto-download) when this file isn't present — e.g. local Windows dev.
+CHROMEDRIVER_PATH = "/usr/local/bin/chromedriver"
+
 
 def create_driver(browser: str) -> webdriver.Remote:
     """Create and return a Selenium WebDriver instance.
@@ -43,7 +47,11 @@ def create_driver(browser: str) -> webdriver.Remote:
             options.add_argument("--disable-dev-shm-usage")
             options.add_argument("--disable-gpu")
             options.add_argument("--window-size=1920,1080")
-        driver = webdriver.Chrome(service=ChromeService(), options=options)
+        if os.path.isfile(CHROMEDRIVER_PATH):
+            service = ChromeService(executable_path=CHROMEDRIVER_PATH)
+        else:
+            service = ChromeService()
+        driver = webdriver.Chrome(service=service, options=options)
         log.info("Chrome WebDriver initialized (headless=%s)", HEADLESS)
 
     else:
