@@ -32,7 +32,7 @@ from bot.utils import (
 )
 from bot.google_sheets import (
     InvoiceRow, read_todo_items, mark_fully_done, mark_error,
-    _write_todo_status, read_todo_status,
+    write_pod_status, write_pod_timestamp, read_todo_status,
 )
 from bot.google_drive import download_file, cleanup_temp_file
 
@@ -54,7 +54,7 @@ def navigate_to_tile(driver: WebDriver):
             lambda d: d.execute_script("""
                 var spans = document.querySelectorAll('span');
                 for (var i = 0; i < spans.length; i++) {
-                    if (spans[i].offsetParent === null) continue;
+                    // offsetParent check removed — unreliable in headless
                     var t = spans[i].textContent.replace(/\\xAD/g, '').trim();
                     if (/Freight Documents \\(/.test(t)) return true;
                     if (t.indexOf('Documents for Reporting') !== -1) return true;
@@ -81,7 +81,7 @@ def dismiss_any_popup(driver: WebDriver) -> bool:
         var dialogs = document.querySelectorAll('[class*="sapMDialog"], [role="dialog"]');
         for (var i = dialogs.length - 1; i >= 0; i--) {
             var d = dialogs[i];
-            if (d.offsetParent === null) continue;
+            // offsetParent check removed — unreliable in headless
             var btns = d.querySelectorAll('button');
             for (var j = 0; j < btns.length; j++) {
                 var t = btns[j].textContent.replace(/\\xAD/g, '').trim();
@@ -189,7 +189,7 @@ def click_into_first_row(driver: WebDriver) -> bool:
     on_detail = driver.execute_script("""
         var spans = document.querySelectorAll('span');
         for (var i = 0; i < spans.length; i++) {
-            if (spans[i].offsetParent === null) continue;
+            // offsetParent check removed — unreliable in headless
             var t = spans[i].textContent.replace(/\\xAD/g, '').trim();
             if (/^Stop \\d/.test(t)) return 'stop_header';
             if (t === 'Information' || t === 'Attachments') return 'detail_tab';
@@ -226,7 +226,7 @@ def expand_stop_2(driver: WebDriver):
     expanded = driver.execute_script("""
         var links = document.querySelectorAll('a, button, span');
         for (var i = 0; i < links.length; i++) {
-            if (links[i].offsetParent === null) continue;
+            // offsetParent check removed — unreliable in headless
             var t = links[i].textContent.replace(/\\xAD/g, '').trim();
             if (t === 'Expand All') {
                 links[i].click();
@@ -246,7 +246,7 @@ def expand_stop_2(driver: WebDriver):
     stop2_header = driver.execute_script("""
         var all = document.querySelectorAll('span, div, a, button');
         for (var i = 0; i < all.length; i++) {
-            if (all[i].offsetParent === null) continue;
+            // offsetParent check removed — unreliable in headless
             var t = all[i].textContent.replace(/\\xAD/g, '').trim();
             if (/^Stop 2/.test(t) && t.length < 150) {
                 // Prefer the closest panel/section header element
@@ -292,7 +292,7 @@ def expand_stop_2(driver: WebDriver):
     driver.execute_script("""
         var all = document.querySelectorAll('span, div');
         for (var i = 0; i < all.length; i++) {
-            if (all[i].offsetParent === null) continue;
+            // offsetParent check removed — unreliable in headless
             var t = all[i].textContent.replace(/\\xAD/g, '').trim();
             if (t.indexOf('Proof of Delivery') !== -1) {
                 all[i].scrollIntoView({block: 'center'});
@@ -301,7 +301,7 @@ def expand_stop_2(driver: WebDriver):
         }
         // Fallback: scroll to Stop 2 header
         for (var i = 0; i < all.length; i++) {
-            if (all[i].offsetParent === null) continue;
+            // offsetParent check removed — unreliable in headless
             var t = all[i].textContent.replace(/\\xAD/g, '').trim();
             if (/^Stop 2/.test(t) && t.length < 150) {
                 all[i].scrollIntoView({block: 'center'});
@@ -317,7 +317,7 @@ def find_proof_of_delivery_report_btn(driver: WebDriver):
     return driver.execute_script("""
         var spans = document.querySelectorAll('span, h3, h4');
         for (var i = 0; i < spans.length; i++) {
-            if (spans[i].offsetParent === null) continue;
+            // offsetParent check removed — unreliable in headless
             var t = spans[i].textContent.replace(/\\xAD/g, '').trim();
             if (t.indexOf('Proof of Delivery') !== -1) {
                 // Walk up to find the Report button in this section
@@ -343,7 +343,7 @@ def read_planned_time_from_popup(driver: WebDriver) -> str | None:
         var dialogs = document.querySelectorAll('[class*="sapMDialog"], [role="dialog"]');
         for (var i = dialogs.length - 1; i >= 0; i--) {
             var d = dialogs[i];
-            if (d.offsetParent === null) continue;
+            // offsetParent check removed — unreliable in headless
             // Look for "Planned On:" label and its value
             var labels = d.querySelectorAll('label, span');
             for (var j = 0; j < labels.length; j++) {
@@ -403,12 +403,12 @@ def upload_and_report(driver: WebDriver, local_paths: list, *, doc_number: str =
             var dialogs = document.querySelectorAll('[class*="sapMDialog"], [role="dialog"]');
             for (var i = dialogs.length - 1; i >= 0; i--) {
                 var d = dialogs[i];
-                if (d.offsetParent === null) continue;
+                // offsetParent check removed — unreliable in headless
 
                 // Strategy 1: Find input with placeholder "Enter Final Time"
                 var inputs = d.querySelectorAll('input:not([type="hidden"]):not([type="file"])');
                 for (var j = 0; j < inputs.length; j++) {
-                    if (inputs[j].offsetParent === null) continue;
+                    // offsetParent check removed — unreliable in headless
                     var ph = inputs[j].placeholder || '';
                     var al = inputs[j].getAttribute('aria-label') || '';
                     if (ph.indexOf('Final Time') !== -1 || al.indexOf('Final Time') !== -1) {
@@ -418,7 +418,7 @@ def upload_and_report(driver: WebDriver, local_paths: list, *, doc_number: str =
 
                 // Strategy 2: Find input that's NOT the reason code / timezone
                 for (var j = 0; j < inputs.length; j++) {
-                    if (inputs[j].offsetParent === null) continue;
+                    // offsetParent check removed — unreliable in headless
                     var ph = (inputs[j].placeholder || '').toLowerCase();
                     var al = (inputs[j].getAttribute('aria-label') || '').toLowerCase();
                     // Skip reason and timezone inputs
@@ -458,10 +458,10 @@ def upload_and_report(driver: WebDriver, local_paths: list, *, doc_number: str =
                 var results = [];
                 for (var i = dialogs.length - 1; i >= 0; i--) {
                     var d = dialogs[i];
-                    if (d.offsetParent === null) continue;
+                    // offsetParent check removed — unreliable in headless
                     var inputs = d.querySelectorAll('input:not([type="hidden"])');
                     for (var j = 0; j < inputs.length; j++) {
-                        if (inputs[j].offsetParent === null) continue;
+                        // offsetParent check removed — unreliable in headless
                         results.push({
                             placeholder: inputs[j].placeholder,
                             ariaLabel: inputs[j].getAttribute('aria-label'),
@@ -527,7 +527,7 @@ def upload_and_report(driver: WebDriver, local_paths: list, *, doc_number: str =
         var dialogs = document.querySelectorAll('[class*="sapMDialog"], [role="dialog"]');
         for (var i = dialogs.length - 1; i >= 0; i--) {
             var d = dialogs[i];
-            if (d.offsetParent === null) continue;
+            // offsetParent check removed — unreliable in headless
             var btns = d.querySelectorAll('button');
             for (var j = 0; j < btns.length; j++) {
                 var t = btns[j].textContent.replace(/\\xAD/g, '').trim();
@@ -544,7 +544,7 @@ def upload_and_report(driver: WebDriver, local_paths: list, *, doc_number: str =
                 var dialogs = document.querySelectorAll('[class*="sapMDialog"], [role="dialog"]');
                 for (var i = dialogs.length - 1; i >= 0; i--) {
                     var d = dialogs[i];
-                    if (d.offsetParent === null) continue;
+                    // offsetParent check removed — unreliable in headless
                     var btns = d.querySelectorAll('button');
                     for (var j = 0; j < btns.length; j++) {
                         var t = btns[j].textContent.replace(/\\xAD/g, '').trim();
@@ -661,6 +661,14 @@ def run(driver: WebDriver, *, dry_run: bool = False, **_kwargs):
         log.info("No items in To Do tab — nothing to upload")
         return {"uploaded": 0, "errors": 0}
 
+    # Skip rows that are already POD-uploaded (col L == "pod_uploaded") so user
+    # can leave half-done items on the To Do tab without bot re-processing them.
+    already_done = [r for r in rows if r.tile4_status.strip().lower() == "pod_uploaded"]
+    if already_done:
+        log.info("Skipping %d already-uploaded rows (col L='pod_uploaded'): %s",
+                 len(already_done), [r.document_1 for r in already_done])
+    rows = [r for r in rows if r.tile4_status.strip().lower() != "pod_uploaded"]
+
     # Filter to rows with POD filename — Pause flag only affects tile 3, not tile 4
     pod_rows = [r for r in rows if r.pod_filename]
     if not pod_rows:
@@ -676,7 +684,8 @@ def run(driver: WebDriver, *, dry_run: bool = False, **_kwargs):
                  i + 1, len(pod_rows), row.document_1, filenames)
 
         # Mark in-progress (yellow) so user can see activity
-        _write_todo_status(row.document_1, "tile4_in_progress", color="yellow")
+        write_pod_timestamp(row.document_1)
+        write_pod_status(row.document_1, "tile4_in_progress", color="yellow")
 
         # Download all PDFs from Google Drive
         local_paths = []
@@ -692,7 +701,7 @@ def run(driver: WebDriver, *, dry_run: bool = False, **_kwargs):
             missing = ", ".join(download_errors)
             log.error("Missing PDFs in Drive: %s", missing)
             # Don't move to Status — this might be temporary (file not uploaded yet)
-            _write_todo_status(row.document_1, f"pod_error: PDFs not in Drive: {missing}")
+            write_pod_status(row.document_1, f"pod_error: PDFs not in Drive: {missing}")
             results["errors"] += 1
             for p in local_paths:
                 cleanup_temp_file(p)
@@ -737,14 +746,7 @@ def run(driver: WebDriver, *, dry_run: bool = False, **_kwargs):
 
             if status1 == "done" and (not row.is_collective or pod2_status == "done"):
                 results["uploaded"] += 1
-                current_status = read_todo_status(row.document_1)
-
-                if "invoiced" in current_status.lower():
-                    log.info("Both tile 3 (invoiced) and tile 4 (pod uploaded) done — moving to Status")
-                    mark_fully_done(row, pod_uploaded_1=pod1_status, pod_uploaded_2=pod2_status)
-                else:
-                    log.info("POD uploaded but tile 3 not done yet — marking in To Do")
-                    _write_todo_status(row.document_1, "pod_uploaded")
+                write_pod_status(row.document_1, "pod_uploaded")
 
             elif status1 == "dry_run":
                 results["skipped"] += 1
@@ -753,7 +755,7 @@ def run(driver: WebDriver, *, dry_run: bool = False, **_kwargs):
                 error_msg = f"doc1: {pod1_status}"
                 if pod2_status:
                     error_msg += f", doc2: {pod2_status}"
-                _write_todo_status(row.document_1, f"pod_error: {error_msg}")
+                write_pod_status(row.document_1, f"pod_error: {error_msg}")
 
         finally:
             for p in local_paths:

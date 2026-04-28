@@ -73,7 +73,7 @@ def dismiss_any_popup(driver: WebDriver) -> bool:
         var dialogs = document.querySelectorAll('[class*="sapMDialog"], [role="dialog"]');
         for (var i = dialogs.length - 1; i >= 0; i--) {
             var d = dialogs[i];
-            if (d.offsetParent === null) continue;
+            // offsetParent check removed — unreliable in headless
             var btns = d.querySelectorAll('button');
             for (var j = 0; j < btns.length; j++) {
                 var t = btns[j].textContent.replace(/\\xAD/g, '').trim();
@@ -172,14 +172,19 @@ def filter_collective_documents(driver: WebDriver, doc1: str, doc2: str):
 
 
 def count_visible_rows(driver: WebDriver) -> int:
-    """Count visible data rows in the current table view."""
+    """Count data rows in the current table view.
+
+    Does NOT check offsetParent (unreliable in headless Chrome).
+    Instead checks for non-empty text content and skips headers.
+    """
     return driver.execute_script("""
         var rows = document.querySelectorAll('.sapMListItems .sapMLIB, .sapMListTblRow');
         var n = 0;
         for (var i = 0; i < rows.length; i++) {
-            if (rows[i].offsetParent === null) continue;
             if (rows[i].classList.contains('sapMListTblHeader')) continue;
-            if (rows[i].textContent.trim().length > 0) n++;
+            // Skip "no data" placeholder rows
+            var t = rows[i].textContent.trim();
+            if (t.length > 0 && t.indexOf('no data') === -1) n++;
         }
         return n;
     """) or 0
@@ -288,7 +293,7 @@ def read_row_doc_and_status(driver: WebDriver) -> list[dict]:
         var results = [];
         var rows = document.querySelectorAll('.sapMListItems .sapMLIB, .sapMListTblRow');
         for (var i = 0; i < rows.length; i++) {
-            if (rows[i].offsetParent === null) continue;
+            // offsetParent check removed — unreliable in headless
             if (rows[i].classList.contains('sapMListTblHeader')) continue;
             var text = rows[i].textContent.replace(/\\xAD/g, '').trim();
             if (text.length === 0) continue;
@@ -343,7 +348,7 @@ def select_specific_rows(driver: WebDriver, doc_numbers: list) -> int:
             var target = arguments[0];
             var rows = document.querySelectorAll('.sapMListItems .sapMLIB, .sapMListTblRow');
             for (var i = 0; i < rows.length; i++) {
-                if (rows[i].offsetParent === null) continue;
+                // offsetParent check removed — unreliable in headless
                 if (rows[i].classList.contains('sapMListTblHeader')) continue;
                 var text = rows[i].textContent.replace(/\\xAD/g, '').trim();
                 if (text.indexOf(target) !== -1) {
@@ -379,10 +384,10 @@ def select_all_visible_rows(driver: WebDriver):
         var cbs = [];
         var rows = document.querySelectorAll('.sapMListItems .sapMLIB, .sapMListTblRow');
         for (var i = 0; i < rows.length; i++) {
-            if (rows[i].offsetParent === null) continue;
+            // offsetParent check removed — unreliable in headless
             if (rows[i].classList.contains('sapMListTblHeader')) continue;
             var cb = rows[i].querySelector('.sapMCb');
-            if (cb && cb.offsetParent !== null) cbs.push(cb);
+            if (cb) cbs.push(cb);
         }
         return cbs;
     """)
@@ -410,7 +415,7 @@ def click_create_invoice(driver: WebDriver, collective: bool) -> bool:
         var target = arguments[0];
         var btns = document.querySelectorAll('button');
         for (var i = 0; i < btns.length; i++) {
-            if (btns[i].offsetParent === null) continue;
+            // offsetParent check removed — unreliable in headless
             var t = btns[i].textContent.replace(/\\xAD/g, '').trim();
             if (t === target) return btns[i];
         }
@@ -438,7 +443,7 @@ def enter_invoice_number(driver: WebDriver, invoice_num: str):
     driver.execute_script("""
         var spans = document.querySelectorAll('span');
         for (var i = 0; i < spans.length; i++) {
-            if (spans[i].offsetParent === null) continue;
+            // offsetParent check removed — unreliable in headless
             var t = spans[i].textContent.replace(/\\xAD/g, '').trim();
             if (t === 'Invoice Details') {
                 var tab = spans[i].closest('[role="tab"], [class*="sapMITBFilter"], [class*="sapMITBItem"]');
@@ -455,7 +460,7 @@ def enter_invoice_number(driver: WebDriver, invoice_num: str):
     inv_input = driver.execute_script("""
         // Strategy 1: find by input id containing 'invoiceId' (draft invoice page)
         var byId = document.querySelector('input[id*="invoiceId"]:not([type="hidden"])');
-        if (byId && byId.offsetParent !== null) return byId;
+        if (byId) return byId;
 
         // Strategy 2: find by "Invoice:" label
         var labels = document.querySelectorAll('label, span');
@@ -465,7 +470,7 @@ def enter_invoice_number(driver: WebDriver, invoice_num: str):
                 var parent = labels[i].parentElement;
                 for (var j = 0; j < 5 && parent; j++) {
                     var input = parent.querySelector('input:not([type="hidden"])');
-                    if (input && input.offsetParent !== null) return input;
+                    if (input) return input;
                     parent = parent.parentElement;
                 }
             }
@@ -506,7 +511,7 @@ def add_charge(driver: WebDriver, charge_type: str, amount: float, doc_number: s
     charges_tab = driver.execute_script("""
         var spans = document.querySelectorAll('span, div');
         for (var i = 0; i < spans.length; i++) {
-            if (spans[i].offsetParent === null) continue;
+            // offsetParent check removed — unreliable in headless
             var t = spans[i].textContent.replace(/\\xAD/g, '').trim();
             if (t === 'Charges') {
                 var tab = spans[i].closest('[role="tab"], [class*="sapMITBFilter"], [class*="sapMITBItem"]');
@@ -545,7 +550,7 @@ def add_charge(driver: WebDriver, charge_type: str, amount: float, doc_number: s
             // Find all sections/headers containing the freight doc number
             var all = document.querySelectorAll('*');
             for (var i = 0; i < all.length; i++) {
-                if (all[i].offsetParent === null) continue;
+                // offsetParent check removed — unreliable in headless
                 var t = all[i].textContent.replace(/\\xAD/g, '').trim();
                 // Match "Freight Document <number>" header
                 if (t.indexOf('Freight Document') !== -1 && t.indexOf(targetDoc) !== -1 && t.length < 100) {
@@ -577,7 +582,7 @@ def add_charge(driver: WebDriver, charge_type: str, amount: float, doc_number: s
         var btns = document.querySelectorAll('button');
         var lastAdd = null;
         for (var i = 0; i < btns.length; i++) {
-            if (btns[i].offsetParent === null) continue;
+            // offsetParent check removed — unreliable in headless
             var t = btns[i].textContent.replace(/\\xAD/g, '').trim();
             if (t === 'Add') lastAdd = btns[i];
         }
@@ -602,7 +607,7 @@ def add_charge(driver: WebDriver, charge_type: str, amount: float, doc_number: s
     charge_option_clicked = driver.execute_script("""
         var items = document.querySelectorAll('li, [role="option"]');
         for (var i = 0; i < items.length; i++) {
-            if (items[i].offsetParent === null) continue;
+            // offsetParent check removed — unreliable in headless
             var t = items[i].textContent.replace(/\\xAD/g, '').trim();
             if (t === 'Charge') { items[i].click(); return true; }
         }
@@ -621,7 +626,7 @@ def add_charge(driver: WebDriver, charge_type: str, amount: float, doc_number: s
         var all = document.querySelectorAll('*');
         var results = [];
         for (var i = 0; i < all.length; i++) {
-            if (all[i].offsetParent === null) continue;
+            // offsetParent check removed — unreliable in headless
             var t = all[i].textContent.replace(/\\xAD/g, '').trim();
             if (t.indexOf('Freight Document') !== -1 && t.length < 50) {
                 // Dump the parent's HTML
@@ -633,7 +638,7 @@ def add_charge(driver: WebDriver, charge_type: str, amount: float, doc_number: s
         var emptyInputs = [];
         var inputs = document.querySelectorAll('input:not([type="hidden"])');
         for (var i = 0; i < inputs.length; i++) {
-            if (inputs[i].offsetParent === null) continue;
+            // offsetParent check removed — unreliable in headless
             if (inputs[i].value.trim() === '' || inputs[i].value.trim().length < 3) {
                 emptyInputs.push({
                     id: inputs[i].id,
@@ -660,14 +665,17 @@ def add_charge(driver: WebDriver, charge_type: str, amount: float, doc_number: s
         // We need to click the PARENT sapMInput wrapper or its value help icon,
         // not the inner input directly
 
-        // Find the empty sapMInputBaseInner (the one we identified in debug)
+        // Find the charge description input — identified by ID containing "__clone"
+        // This distinguishes it from filter bar inputs (which have IDs like "FilterBar-...")
         var inputs = document.querySelectorAll('input.sapMInputBaseInner');
         var target = null;
         for (var i = 0; i < inputs.length; i++) {
-            if (inputs[i].offsetParent === null) continue;
             if (inputs[i].value.trim() === '' && inputs[i].type === 'text') {
-                // Skip the search bar
-                if (inputs[i].id.indexOf('Search') !== -1 || inputs[i].id.indexOf('search') !== -1) continue;
+                var id = inputs[i].id || '';
+                // Must have "__clone" in ID (charge table inputs) — skip filter bar inputs
+                if (id.indexOf('__clone') === -1) continue;
+                // Skip search bars
+                if (id.indexOf('Search') !== -1 || id.indexOf('search') !== -1) continue;
                 target = inputs[i];
                 break;
             }
@@ -679,7 +687,7 @@ def add_charge(driver: WebDriver, charge_type: str, amount: float, doc_number: s
         var parent = target.closest('.sapMInput, .sapMInputBase, [class*="sapMInput"]');
         if (parent) {
             var vhIcon = parent.querySelector('[class*="ValueHelp"], .sapMInputBaseIcon, .sapUiIcon');
-            if (vhIcon && vhIcon.offsetParent !== null) return vhIcon;
+            if (vhIcon) return vhIcon;
             // No icon — return the parent wrapper itself
             return parent;
         }
@@ -712,10 +720,10 @@ def add_charge(driver: WebDriver, charge_type: str, amount: float, doc_number: s
         var dialogs = document.querySelectorAll('[class*="sapMDialog"], [role="dialog"]');
         for (var i = dialogs.length - 1; i >= 0; i--) {
             var d = dialogs[i];
-            if (d.offsetParent === null) continue;
+            // offsetParent check removed — unreliable in headless
             // Find the search input in the dialog
             var searchInput = d.querySelector('input[type="search"], input[placeholder*="earch"], input.sapMInputBaseInner');
-            if (searchInput && searchInput.offsetParent !== null) return searchInput;
+            if (searchInput) return searchInput;
         }
         return null;
     """)
@@ -742,11 +750,11 @@ def add_charge(driver: WebDriver, charge_type: str, amount: float, doc_number: s
         var dialogs = document.querySelectorAll('[class*="sapMDialog"], [role="dialog"]');
         for (var i = dialogs.length - 1; i >= 0; i--) {
             var d = dialogs[i];
-            if (d.offsetParent === null) continue;
+            // offsetParent check removed — unreliable in headless
             // Search in table rows and list items
             var items = d.querySelectorAll('tr, li, [role="row"], .sapMLIB');
             for (var j = 0; j < items.length; j++) {
-                if (items[j].offsetParent === null) continue;
+                // offsetParent check removed — unreliable in headless
                 var t = items[j].textContent.replace(/\\xAD/g, '').trim().toLowerCase();
                 if (t.indexOf(target) !== -1 && t.length < 200) {
                     return items[j];
@@ -789,7 +797,7 @@ def add_charge(driver: WebDriver, charge_type: str, amount: float, doc_number: s
         var inputs = document.querySelectorAll('input:not([type="hidden"]):not([type="file"])');
         var results = [];
         for (var i = 0; i < inputs.length; i++) {
-            if (inputs[i].offsetParent === null) continue;
+            // offsetParent check removed — unreliable in headless
             results.push({
                 id: inputs[i].id.substring(0, 60),
                 value: inputs[i].value,
@@ -806,7 +814,7 @@ def add_charge(driver: WebDriver, charge_type: str, amount: float, doc_number: s
         // For the correct leg, find the one with value 0.00 (the just-added charge row)
         var inputs = document.querySelectorAll('input[id*="rateInput"]');
         for (var i = 0; i < inputs.length; i++) {
-            if (inputs[i].offsetParent === null) continue;
+            // offsetParent check removed — unreliable in headless
             var val = inputs[i].value.trim();
             if (val === '0.00' || val === '0' || val === '') {
                 return inputs[i];
@@ -816,7 +824,7 @@ def add_charge(driver: WebDriver, charge_type: str, amount: float, doc_number: s
         // Fallback: any visible input with id containing 'rate' and zero value
         var allInputs = document.querySelectorAll('input');
         for (var i = 0; i < allInputs.length; i++) {
-            if (allInputs[i].offsetParent === null) continue;
+            // offsetParent check removed — unreliable in headless
             var id = (allInputs[i].id || '').toLowerCase();
             var val = allInputs[i].value.trim();
             if (id.indexOf('rate') !== -1 && (val === '0.00' || val === '0' || val === '')) {
@@ -853,7 +861,7 @@ def click_submit(driver: WebDriver, *, invoice_num: str = ""):
     btn = driver.execute_script("""
         var btns = document.querySelectorAll('button');
         for (var i = 0; i < btns.length; i++) {
-            if (btns[i].offsetParent === null) continue;
+            // offsetParent check removed — unreliable in headless
             var t = btns[i].textContent.replace(/\\xAD/g, '').trim();
             if (t === 'Submit') return btns[i];
         }
@@ -880,7 +888,7 @@ def click_save(driver: WebDriver, invoice_num: str = ""):
     btn = driver.execute_script("""
         var btns = document.querySelectorAll('button');
         for (var i = 0; i < btns.length; i++) {
-            if (btns[i].offsetParent === null) continue;
+            // offsetParent check removed — unreliable in headless
             var t = btns[i].textContent.replace(/\\xAD/g, '').trim();
             if (t === 'Save') return btns[i];
         }
@@ -956,7 +964,7 @@ def navigate_to_manage_invoices(driver: WebDriver):
             lambda d: d.execute_script("""
                 var spans = document.querySelectorAll('span');
                 for (var i = 0; i < spans.length; i++) {
-                    if (spans[i].offsetParent === null) continue;
+                    // offsetParent check removed — unreliable in headless
                     var t = spans[i].textContent.replace(/\\xAD/g, '').trim();
                     if (t.indexOf('Draft') !== -1 || t.indexOf('Invoicing in Process') !== -1) return true;
                 }
@@ -982,7 +990,7 @@ def click_drafts_tab(driver: WebDriver):
     driver.execute_script("""
         var spans = document.querySelectorAll('span');
         for (var i = 0; i < spans.length; i++) {
-            if (spans[i].offsetParent === null) continue;
+            // offsetParent check removed — unreliable in headless
             var clean = spans[i].textContent.replace(/\\xAD/g, '').trim();
             if (/^Draft/.test(clean)) {
                 var tab = spans[i].closest('[role="tab"], [class*="sapMITBFilter"], [class*="sapMITBItem"]');
@@ -1115,7 +1123,7 @@ def process_drafted_invoice(driver: WebDriver, row: InvoiceRow,
         on_invoice = driver.execute_script("""
             var spans = document.querySelectorAll('span');
             for (var i = 0; i < spans.length; i++) {
-                if (spans[i].offsetParent === null) continue;
+                // offsetParent check removed — unreliable in headless
                 var t = spans[i].textContent.replace(/\\xAD/g, '').trim();
                 if (t === 'Invoice Details') return true;
             }
@@ -1228,7 +1236,7 @@ def process_row(driver: WebDriver, row: InvoiceRow,
         on_invoice = driver.execute_script("""
             var spans = document.querySelectorAll('span');
             for (var i = 0; i < spans.length; i++) {
-                if (spans[i].offsetParent === null) continue;
+                // offsetParent check removed — unreliable in headless
                 var t = spans[i].textContent.replace(/\\xAD/g, '').trim();
                 if (t === 'Invoice Details') return true;
             }
@@ -1241,7 +1249,7 @@ def process_row(driver: WebDriver, row: InvoiceRow,
                 var dialogs = document.querySelectorAll('[class*="sapMDialog"], [role="dialog"]');
                 for (var i = dialogs.length - 1; i >= 0; i--) {
                     var d = dialogs[i];
-                    if (d.offsetParent === null) continue;
+                    // offsetParent check removed — unreliable in headless
                     return d.textContent.substring(0, 300).trim();
                 }
                 return null;
@@ -1282,6 +1290,14 @@ def run(driver: WebDriver, *, dry_run: bool = False, step_through: bool = False,
         log.info("No items in To Do tab — nothing to invoice")
         return {"submitted": 0, "errors": 0}
 
+    # Skip rows that are already invoiced (col J == "invoiced") so user can
+    # leave half-done items on the To Do tab without bot re-processing them.
+    already_done = [r for r in rows if r.tile3_status.strip().lower() == "invoiced"]
+    if already_done:
+        log.info("Skipping %d already-invoiced rows (col J='invoiced'): %s",
+                 len(already_done), [r.document_1 for r in already_done])
+    rows = [r for r in rows if r.tile3_status.strip().lower() != "invoiced"]
+
     # Process non-paused items first, then paused items stay in To Do
     active_rows = [r for r in rows if not r.pause]
     paused_rows = [r for r in rows if r.pause]
@@ -1305,27 +1321,21 @@ def run(driver: WebDriver, *, dry_run: bool = False, step_through: bool = False,
         log.info("════ Invoice %d/%d (doc %s)%s ════",
                  i + 1, len(all_to_process), row.document_1, pause_label)
 
-        # Mark in-progress (yellow) so user can see activity
-        from bot.google_sheets import _write_todo_status
-        _write_todo_status(row.document_1, "tile3_in_progress", color="yellow")
+        # Mark in-progress (yellow) + timestamp
+        from bot.google_sheets import write_invoice_status, write_invoice_timestamp
+        write_invoice_timestamp(row.document_1)
+        write_invoice_status(row.document_1, "tile3_in_progress", color="yellow")
 
         status = process_row(driver, row, dry_run=dry_run, step_through=step_through)
         log.info("Result: %s", status)
 
         if status == "submitted":
             results["submitted"] += 1
-            # Check if tile 4 already ran (col H = "pod_uploaded")
-            current_status = read_todo_status(row.document_1)
-            if "pod_uploaded" in current_status.lower():
-                log.info("Both tile 3 and tile 4 done — moving to Status")
-                mark_fully_done(row, pod_uploaded_1="done",
-                                pod_uploaded_2="done" if row.is_collective else "")
+            note = getattr(row, '_skipped_note', '')
+            if note:
+                mark_tile3_done_with_note(row, note)
             else:
-                note = getattr(row, '_skipped_note', '')
-                if note:
-                    mark_tile3_done_with_note(row, note)
-                else:
-                    mark_tile3_done(row)  # stays in To Do for tile 4
+                mark_tile3_done(row)
         elif status == "paused":
             results["paused"] += 1
             mark_tile3_paused(row)
@@ -1348,15 +1358,14 @@ def run(driver: WebDriver, *, dry_run: bool = False, step_through: bool = False,
             else:
                 results["errors"] += 1
                 # Don't move to Status — leave in To Do with error in col H so it retries next cycle
-                from bot.google_sheets import _write_todo_status
-                _write_todo_status(row.document_1,
+                from bot.google_sheets import write_invoice_status
+                write_invoice_status(row.document_1,
                                    f"tile3_error: {draft_status.replace('error: ', '')}")
         elif status.startswith("error:"):
             results["errors"] += 1
-            # Don't move to Status — leave in To Do for retry
-            from bot.google_sheets import _write_todo_status
-            _write_todo_status(row.document_1,
-                               f"tile3_error: {status.replace('error: ', '')}")
+            from bot.google_sheets import write_invoice_status
+            write_invoice_status(row.document_1,
+                                 f"tile3_error: {status.replace('error: ', '')}")
 
         # Navigate back to Invoice Freight Documents tile for next item
         if i < len(all_to_process) - 1:
@@ -1366,7 +1375,7 @@ def run(driver: WebDriver, *, dry_run: bool = False, step_through: bool = False,
             navigate_to_tile(driver)
 
     # Sort paused rows to top of To Do for easy human access
-    sort_paused_rows_to_top()
+    # sort_paused_rows_to_top()  # disabled — no row reordering
 
     log.info("Tile 3 complete: %s", results)
     return results

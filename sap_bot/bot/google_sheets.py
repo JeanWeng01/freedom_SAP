@@ -41,8 +41,10 @@ COL_POD_FILENAME = 4 # E
 COL_CHARGE_HRS1 = 5  # F
 COL_CHARGE_HRS2 = 6  # G
 COL_PAUSE = 7        # H
-# Col I (8): local run heartbeat timestamp (single cell I2)
-COL_TODO_STATUS = 9  # J — bot writes: "invoiced", "paused", "tile3_in_progress", etc.
+# Col I (8): tile 3 timestamp + heartbeat in I2
+# Col J (9): tile 3 status
+# Col K (10): tile 4 timestamp
+# Col L (11): tile 4 status
 
 
 @dataclass
@@ -57,6 +59,8 @@ class InvoiceRow:
     charge_hours_2: float | None
     pause: bool  # True = skip submit, save instead
     notes: str = ""  # human notes from col C — bot ignores for processing but preserves when moving to Status
+    tile3_status: str = ""  # col J — if "invoiced", tile 3 will skip this row
+    tile4_status: str = ""  # col L — if "pod_uploaded", tile 4 will skip this row
 
     @property
     def is_collective(self) -> bool:
@@ -160,7 +164,7 @@ def read_todo_items() -> list[InvoiceRow]:
     service = _get_sheets_service()
     result = service.spreadsheets().values().get(
         spreadsheetId=SHEET_ID,
-        range=f"'{TODO_TAB}'!A:J",
+        range=f"'{TODO_TAB}'!A:L",
     ).execute()
 
     rows = result.get("values", [])
@@ -171,8 +175,13 @@ def read_todo_items() -> list[InvoiceRow]:
     items = []
     for i, row in enumerate(rows[1:], start=2):  # skip header, 1-based row numbers
         doc1 = _cell_val(row, COL_DOC1)
-        if not doc1:
-            continue  # skip blank rows
+        if not doc1 or not doc1.isdigit() or len(doc1) != 10:
+            continue  # skip rows without a valid 10-digit doc number in col A
+
+        # Skip rows where Invoice (col D) is blank — means already processed & cleared
+        invoice = _cell_val(row, COL_INVOICE)
+        if not invoice:
+            continue
 
         pause_val = _cell_val(row, COL_PAUSE)
         is_paused = pause_val == "1" or (pause_val and pause_val.lower() == "true")
@@ -187,6 +196,8 @@ def read_todo_items() -> list[InvoiceRow]:
             charge_hours_2=_float_val(row, COL_CHARGE_HRS2),
             pause=is_paused,
             notes=_cell_val(row, 2) or "",  # col C human notes
+            tile3_status=_cell_val(row, 9) or "",   # col J
+            tile4_status=_cell_val(row, 11) or "",  # col L
         )
         items.append(item)
 
@@ -236,10 +247,11 @@ def move_to_status(item: InvoiceRow, status: str,
     # Apply color formatting to the new row
     _apply_status_colors(service, status, pod_uploaded_1, pod_uploaded_2)
 
-    # Delete the row from To Do tab
-    _delete_todo_row(service, item.document_1)
+    # Clear processed data from To Do (but keep A & B formulas and H pause marker intact)
+    # Clear: C-G (Note, Invoice, POD_Filename, Charge_Hrs_1, Charge_Hrs_2) and I-J (Timestamp, Status)
+    _clear_todo_row_data(service, item.document_1)
 
-    log.info("Moved doc %s to Status tab: %s", item.document_1, status)
+    log.info("Moved doc %s to Status tab and cleared To Do row: %s", item.document_1, status)
 
 
 def _apply_status_colors(service, status: str, pod1: str, pod2: str):
@@ -354,6 +366,55 @@ def _delete_todo_row(service, document_1: str):
         log.error("Error deleting row from To Do: %s", e)
 
 
+def _clear_todo_row_data(service, document_1: str):
+    """Clear processed data from a To Do row, keeping A & B (formulas) and H (pause) intact.
+
+    Clears: C-G (Note, Invoice, POD_Filename, Charge_Hrs_1, Charge_Hrs_2)
+            I-J (Local_Run_Timestamp, Status)
+    """
+    try:
+        current = service.spreadsheets().values().get(
+            spreadsheetId=SHEET_ID,
+            range=f"'{TODO_TAB}'!A:A",
+        ).execute()
+        current_rows = current.get("values", [])
+
+        target_idx = None
+        for idx, r in enumerate(current_rows):
+            if idx == 0:
+                continue
+            if r and str(r[0]).strip() == document_1:
+                target_idx = idx
+                break
+
+        if target_idx is None:
+            log.warning("Could not find row for doc %s to clear", document_1)
+            return
+
+        row_num = target_idx + 1  # 1-based
+
+        # Clear C-G (cols 3-7) and I-J (cols 9-10)
+        service.spreadsheets().values().batchUpdate(
+            spreadsheetId=SHEET_ID,
+            body={
+                "valueInputOption": "RAW",
+                "data": [
+                    {
+                        "range": f"'{TODO_TAB}'!C{row_num}:G{row_num}",
+                        "values": [["", "", "", "", ""]],
+                    },
+                    {
+                        "range": f"'{TODO_TAB}'!I{row_num}:J{row_num}",
+                        "values": [["", ""]],
+                    },
+                ],
+            },
+        ).execute()
+        log.info("Cleared To Do row %d (doc %s): cols C-G and I-J", row_num, document_1)
+    except Exception as e:
+        log.error("Error clearing To Do row for doc %s: %s", document_1, e)
+
+
 def mark_error(item: InvoiceRow, error_msg: str):
     """Move an item to Status tab with an error message."""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -445,71 +506,59 @@ def read_todo_status(document_1: str) -> str:
     return ""
 
 
-def _write_todo_status(document_1: str, status_text: str, color: str = "auto"):
-    """Append a status value to column J of a row in To Do.
+def _find_row_index(service, document_1: str) -> int | None:
+    """Find the 0-based row index in To Do tab for a given Document_1."""
+    result = service.spreadsheets().values().get(
+        spreadsheetId=SHEET_ID,
+        range=f"'{TODO_TAB}'!A:A",
+    ).execute()
+    rows = result.get("values", [])
+    for idx, r in enumerate(rows):
+        if idx == 0:
+            continue
+        if r and str(r[0]).strip() == document_1:
+            return idx
+    return None
 
-    Appends with '; ' separator so history is preserved:
-      'invoiced' → 'invoiced; pod_uploaded' → 'invoiced; pod_uploaded; tile3_error: ...'
 
-    color: 'green' | 'red' | 'yellow' | 'auto' (auto picks based on status text)
+def _write_todo_cell(document_1: str, col_letter: str, value: str, color: str = "auto"):
+    """Write a value to a specific column of a To Do row, matched by Document_1.
+
+    col_letter: 'I', 'J', 'K', etc.
+    color: 'green' | 'red' | 'yellow' | 'auto'
     """
     service = _get_sheets_service()
     try:
-        # Read both col A (to find row) and col J (current status)
-        result = service.spreadsheets().values().get(
-            spreadsheetId=SHEET_ID,
-            range=f"'{TODO_TAB}'!A:J",
-        ).execute()
-        rows = result.get("values", [])
-
-        target_idx = None
-        current_status = ""
-        for idx, r in enumerate(rows):
-            if idx == 0:
-                continue
-            if r and str(r[0]).strip() == document_1:
-                target_idx = idx
-                current_status = r[9] if len(r) > 9 else ""
-                break
-
+        target_idx = _find_row_index(service, document_1)
         if target_idx is None:
-            log.warning("Could not find doc %s in To Do to update status", document_1)
+            log.warning("Could not find doc %s in To Do", document_1)
             return
 
-        # Append new status (don't duplicate if already present)
-        if current_status and status_text not in current_status:
-            new_status = f"{current_status}; {status_text}"
-        elif not current_status:
-            new_status = status_text
-        else:
-            new_status = current_status  # already contains this status
-
-        # Write the appended value to col J
         service.spreadsheets().values().update(
             spreadsheetId=SHEET_ID,
-            range=f"'{TODO_TAB}'!J{target_idx + 1}",
+            range=f"'{TODO_TAB}'!{col_letter}{target_idx + 1}",
             valueInputOption="RAW",
-            body={"values": [[new_status]]},
+            body={"values": [[value]]},
         ).execute()
-        log.info("Set To Do status for doc %s: '%s'", document_1, new_status)
+        log.info("Set To Do %s%d for doc %s: '%s'", col_letter, target_idx + 1, document_1, value)
 
-        # Determine color
+        # Apply font color
         if color == "auto":
-            txt = status_text.lower()
+            txt = value.lower()
             if "error" in txt or "failed" in txt:
                 color = "red"
-            elif "in_progress" in txt or "processing" in txt or "running" in txt:
+            elif "in_progress" in txt or "processing" in txt:
                 color = "yellow"
             else:
                 color = "green"
 
+        col_index = ord(col_letter.upper()) - ord('A')
         color_rgb = {
             "green": {"red": 0.0, "green": 0.6, "blue": 0.0},
             "red":   {"red": 0.8, "green": 0.0, "blue": 0.0},
             "yellow":{"red": 0.85, "green": 0.65, "blue": 0.0},
         }.get(color, {"red": 0.0, "green": 0.0, "blue": 0.0})
 
-        # Apply font color (no bold)
         meta = service.spreadsheets().get(spreadsheetId=SHEET_ID).execute()
         todo_sheet_id = None
         for sheet in meta.get("sheets", []):
@@ -525,8 +574,8 @@ def _write_todo_status(document_1: str, status_text: str, color: str = "auto"):
                             "sheetId": todo_sheet_id,
                             "startRowIndex": target_idx,
                             "endRowIndex": target_idx + 1,
-                            "startColumnIndex": 9,  # J (Status column)
-                            "endColumnIndex": 10,
+                            "startColumnIndex": col_index,
+                            "endColumnIndex": col_index + 1,
                         },
                         "cell": {
                             "userEnteredFormat": {
@@ -541,13 +590,40 @@ def _write_todo_status(document_1: str, status_text: str, color: str = "auto"):
                 }]},
             ).execute()
     except Exception as e:
-        log.error("Error writing To Do status: %s", e)
+        log.error("Error writing To Do cell: %s", e)
+
+
+def _write_todo_status(document_1: str, status_text: str, color: str = "auto"):
+    """Write to col J (Invoicing Status). Kept for backwards compat."""
+    _write_todo_cell(document_1, "J", status_text, color)
+
+
+def write_invoice_status(document_1: str, status_text: str, color: str = "auto"):
+    """Write to col J (tile 3 status)."""
+    _write_todo_cell(document_1, "J", status_text, color)
+
+
+def write_invoice_timestamp(document_1: str):
+    """Write current timestamp to col I (tile 3 timestamp)."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    _write_todo_cell(document_1, "I", ts, color="green")
+
+
+def write_pod_status(document_1: str, status_text: str, color: str = "auto"):
+    """Write to col L (tile 4 status)."""
+    _write_todo_cell(document_1, "L", status_text, color)
+
+
+def write_pod_timestamp(document_1: str):
+    """Write current timestamp to col K (tile 4 timestamp)."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    _write_todo_cell(document_1, "K", ts, color="green")
 
 
 def mark_tile3_done(item: InvoiceRow):
-    """Mark tile 3 (invoicing) as done — writes 'invoiced' to col H."""
-    _write_todo_status(item.document_1, "invoiced")
-    log.info("Tile 3 done for doc %s — marked 'invoiced', stays in To Do for tile 4", item.document_1)
+    """Mark tile 3 (invoicing) as done."""
+    write_invoice_status(item.document_1, "invoiced")
+    log.info("Tile 3 done for doc %s", item.document_1)
 
 
 def mark_tile3_done_with_note(item: InvoiceRow, note: str):
@@ -594,7 +670,7 @@ def sort_paused_rows_to_top():
                 "sortRange": {
                     "range": {
                         "sheetId": todo_sheet_id,
-                        "startRowIndex": 1,  # skip header
+                        "startRowIndex": 3,  # skip rows 1-3 (headers + notes)
                         "startColumnIndex": 0,
                         "endColumnIndex": 10,  # A through J
                     },
