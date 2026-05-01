@@ -505,8 +505,13 @@ def enter_invoice_number(driver: WebDriver, invoice_num: str):
         take_screenshot(driver, "tile3_invoice_input_missing")
 
 
-def add_charge(driver: WebDriver, charge_type: str, amount: float, doc_number: str = ""):
-    """Add a charge in the Charges tab for a specific freight document."""
+def add_charge(driver: WebDriver, charge_type: str, amount: float, doc_number: str = "") -> bool:
+    """Add a charge in the Charges tab for a specific freight document.
+
+    Returns True if the charge category was selected AND the amount was entered.
+    Returns False on any failure (Charges tab missing, Add btn missing, category
+    not found, amount entry rejected, etc.) — caller must abort the invoice.
+    """
     # Find the Charges tab element
     charges_tab = driver.execute_script("""
         var spans = document.querySelectorAll('span, div');
@@ -525,7 +530,7 @@ def add_charge(driver: WebDriver, charge_type: str, amount: float, doc_number: s
     if not charges_tab:
         log.error("Charges tab not found")
         take_screenshot(driver, "tile3_charges_tab_missing")
-        return
+        return False
 
     # Native click on Charges tab
     try:
@@ -601,7 +606,7 @@ def add_charge(driver: WebDriver, charge_type: str, amount: float, doc_number: s
     else:
         log.error("Add button not found in Charges tab")
         take_screenshot(driver, "tile3_add_charge_missing")
-        return
+        return False
 
     # Some Fiori versions show a dropdown after Add — if "Charge" appears, click it
     charge_option_clicked = driver.execute_script("""
@@ -784,7 +789,7 @@ def add_charge(driver: WebDriver, charge_type: str, amount: float, doc_number: s
         log.error("Could not find '%s' in category search results", charge_type)
         take_screenshot(driver, f"tile3_category_not_found_{charge_type[:15]}")
         dismiss_any_popup(driver)
-        return
+        return False
 
     take_screenshot(driver, f"tile3_category_selected_{charge_type[:15]}")
 
@@ -809,31 +814,48 @@ def add_charge(driver: WebDriver, charge_type: str, amount: float, doc_number: s
     """)
     log.info("DEBUG visible inputs for rate: %s", debug_inputs)
 
+    # Find the rate input on the row we just added.
+    #
+    # Why not "first 0.00 rateInput on page": SAP started rendering 5 read-only
+    # "Excluded Charge" rows per freight doc, each with rateInput=0.00. Picking
+    # the first one would grab a leg-1 excluded charge (read-only → not interactable).
+    #
+    # Reliable approach: SAP UI5 assigns clone numbers monotonically by insertion
+    # order. The just-added description input (now containing the charge type
+    # we just selected) has the highest clone number; its sibling rate input on
+    # the same row has the next-highest clone number.
     rate_input_el = driver.execute_script("""
-        // The rate input has ID containing 'rateInput' and value '0.00' or '0'
-        // For the correct leg, find the one with value 0.00 (the just-added charge row)
-        var inputs = document.querySelectorAll('input[id*="rateInput"]');
-        for (var i = 0; i < inputs.length; i++) {
-            // offsetParent check removed — unreliable in headless
-            var val = inputs[i].value.trim();
-            if (val === '0.00' || val === '0' || val === '') {
-                return inputs[i];
-            }
-        }
+        var chargeType = arguments[0];
 
-        // Fallback: any visible input with id containing 'rate' and zero value
-        var allInputs = document.querySelectorAll('input');
-        for (var i = 0; i < allInputs.length; i++) {
-            // offsetParent check removed — unreliable in headless
-            var id = (allInputs[i].id || '').toLowerCase();
-            var val = allInputs[i].value.trim();
-            if (id.indexOf('rate') !== -1 && (val === '0.00' || val === '0' || val === '')) {
-                return allInputs[i];
-            }
+        // Step 1: find the description input we just filled (highest clone number)
+        var descs = document.querySelectorAll('input.sapMInputBaseInner');
+        var newestDesc = null, newestNum = -1;
+        for (var i = 0; i < descs.length; i++) {
+            if (descs[i].value !== chargeType) continue;
+            var m = (descs[i].id || '').match(/__clone(\\d+)/);
+            if (!m) continue;
+            var n = parseInt(m[1]);
+            if (n > newestNum) { newestNum = n; newestDesc = descs[i]; }
         }
+        if (!newestDesc) return null;
 
-        return null;
-    """)
+        // Step 2: find the rate input with the smallest clone number > newestNum
+        // (= the rate input on the just-added row)
+        var rates = document.querySelectorAll('input[id*="rateInput"]');
+        var best = null, bestNum = Infinity;
+        for (var j = 0; j < rates.length; j++) {
+            var rm = (rates[j].id || '').match(/__clone(\\d+)/);
+            if (!rm) continue;
+            var rn = parseInt(rm[1]);
+            if (rn > newestNum && rn < bestNum) { bestNum = rn; best = rates[j]; }
+        }
+        if (!best) return null;
+
+        // Step 3: sanity check — the just-added row's rate input must still be empty/zero
+        var v = best.value.trim();
+        if (v !== '0.00' && v !== '0' && v !== '') return null;
+        return best;
+    """, charge_type)
 
     if rate_input_el:
         try:
@@ -845,18 +867,28 @@ def add_charge(driver: WebDriver, charge_type: str, amount: float, doc_number: s
             rate_input_el.send_keys(str(amount))
             log.info("Entered charge amount: %s", amount)
         except Exception as e:
-            log.warning("Could not enter amount: %s", e)
+            log.error("Could not enter amount (aborting invoice): %s", e)
+            take_screenshot(driver, f"tile3_amount_entry_failed_{charge_type[:15]}")
+            return False
     else:
         log.error("Rate Amount input not found in new charge row")
         take_screenshot(driver, f"tile3_rate_input_missing_{charge_type[:15]}")
+        return False
 
     _time.sleep(0.5)
     take_screenshot(driver, f"tile3_charge_added_{charge_type[:15]}")
+    return True
 
 
 @destructive_action("Submit invoice {invoice_num}")
-def click_submit(driver: WebDriver, *, invoice_num: str = ""):
-    """Click the Submit button."""
+def click_submit(driver: WebDriver, *, invoice_num: str = "") -> bool:
+    """Click the Submit button.
+
+    Returns True if Submit was clicked AND no popup appeared after (likely success).
+    Returns False if the button was missing OR a popup was dismissed after Submit
+    (popup almost always means SAP rejected the submission). Caller must treat
+    False as failure and NOT mark the row as invoiced.
+    """
     take_screenshot(driver, f"tile3_before_submit_{invoice_num}")
     btn = driver.execute_script("""
         var btns = document.querySelectorAll('button');
@@ -867,19 +899,25 @@ def click_submit(driver: WebDriver, *, invoice_num: str = ""):
         }
         return null;
     """)
-    if btn:
-        try:
-            btn.click()
-        except Exception:
-            ActionChains(driver).move_to_element(btn).click().perform()
-        log.info("Clicked Submit for invoice %s", invoice_num)
-        _time.sleep(2)
-        wait_for_page_ready(driver)
-        dismiss_any_popup(driver)
-        take_screenshot(driver, f"tile3_after_submit_{invoice_num}")
-    else:
+    if not btn:
         log.error("Submit button not found")
         take_screenshot(driver, "tile3_submit_missing")
+        return False
+
+    try:
+        btn.click()
+    except Exception:
+        ActionChains(driver).move_to_element(btn).click().perform()
+    log.info("Clicked Submit for invoice %s", invoice_num)
+    _time.sleep(2)
+    wait_for_page_ready(driver)
+    popup_was_dismissed = dismiss_any_popup(driver)
+    take_screenshot(driver, f"tile3_after_submit_{invoice_num}")
+    if popup_was_dismissed:
+        log.error("Popup appeared after Submit for invoice %s — treating as FAILED submission",
+                  invoice_num)
+        return False
+    return True
 
 
 def click_save(driver: WebDriver, invoice_num: str = ""):
@@ -931,14 +969,24 @@ def click_back(driver: WebDriver):
 
 def fill_invoice_and_submit(driver: WebDriver, row: InvoiceRow,
                             *, dry_run: bool = False, step_through: bool = False) -> str:
-    """Fill invoice number, add charges, and submit (or save if paused)."""
+    """Fill invoice number, add charges, and submit (or save if paused).
+
+    If any charge add fails OR the Submit click triggers a SAP error popup, this
+    returns 'error: ...' so the caller will NOT mark the row as invoiced. This
+    prevents false-positive 'invoiced' reporting when the invoice actually
+    stayed in Drafts due to a silent failure.
+    """
     enter_invoice_number(driver, row.invoice)
 
     if row.has_charges_leg1:
-        add_charge(driver, row.charge_type_1, row.charge_amount_1, doc_number=row.document_1)
+        if not add_charge(driver, row.charge_type_1, row.charge_amount_1,
+                          doc_number=row.document_1):
+            return f"error: failed to add leg 1 charge ({row.charge_type_1})"
 
     if row.is_collective and row.has_charges_leg2:
-        add_charge(driver, row.charge_type_2, row.charge_amount_2, doc_number=row.document_2)
+        if not add_charge(driver, row.charge_type_2, row.charge_amount_2,
+                          doc_number=row.document_2):
+            return f"error: failed to add leg 2 charge ({row.charge_type_2})"
 
     if row.pause:
         # Paused: Save instead of Submit — human will review and submit manually
@@ -946,11 +994,17 @@ def fill_invoice_and_submit(driver: WebDriver, row: InvoiceRow,
         click_back(driver)
         return "paused"
 
-    click_submit(driver, invoice_num=row.invoice, dry_run=dry_run, step_through=step_through)
+    submit_result = click_submit(driver, invoice_num=row.invoice,
+                                 dry_run=dry_run, step_through=step_through)
 
     if dry_run:
         click_back(driver)
         return "dry_run"
+
+    # submit_result: True = success, False = failed (popup or btn missing),
+    # "skipped" = step_through skip (treat as success — user explicitly chose).
+    if submit_result is False:
+        return "error: Submit triggered SAP popup — invoice likely still in Drafts"
 
     return "submitted"
 
@@ -1290,13 +1344,16 @@ def run(driver: WebDriver, *, dry_run: bool = False, step_through: bool = False,
         log.info("No items in To Do tab — nothing to invoice")
         return {"submitted": 0, "errors": 0}
 
-    # Skip rows that are already invoiced (col J == "invoiced") so user can
-    # leave half-done items on the To Do tab without bot re-processing them.
-    already_done = [r for r in rows if r.tile3_status.strip().lower() == "invoiced"]
-    if already_done:
-        log.info("Skipping %d already-invoiced rows (col J='invoiced'): %s",
-                 len(already_done), [r.document_1 for r in already_done])
-    rows = [r for r in rows if r.tile3_status.strip().lower() != "invoiced"]
+    # Skip rows whose col J is exactly "invoiced" (already done) or "wait"
+    # (manually marked by user as not-yet-ready). Lets the user leave half-done
+    # or future items on the To Do tab without bot re-processing them.
+    SKIP_STATUSES = {"invoiced", "wait"}
+    skipped = [r for r in rows if r.tile3_status.strip().lower() in SKIP_STATUSES]
+    if skipped:
+        log.info("Skipping %d rows by col J status: %s",
+                 len(skipped),
+                 [(r.document_1, r.tile3_status.strip()) for r in skipped])
+    rows = [r for r in rows if r.tile3_status.strip().lower() not in SKIP_STATUSES]
 
     # Process non-paused items first, then paused items stay in To Do
     active_rows = [r for r in rows if not r.pause]
