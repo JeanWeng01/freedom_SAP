@@ -557,6 +557,7 @@ def _write_todo_cell(document_1: str, col_letter: str, value: str, color: str = 
             "green": {"red": 0.0, "green": 0.6, "blue": 0.0},
             "red":   {"red": 0.8, "green": 0.0, "blue": 0.0},
             "yellow":{"red": 0.85, "green": 0.65, "blue": 0.0},
+            "orange":{"red": 1.0, "green": 0.45, "blue": 0.0},
         }.get(color, {"red": 0.0, "green": 0.0, "blue": 0.0})
 
         meta = service.spreadsheets().get(spreadsheetId=SHEET_ID).execute()
@@ -633,8 +634,14 @@ def mark_tile3_done_with_note(item: InvoiceRow, note: str):
 
 
 def mark_tile3_paused(item: InvoiceRow):
-    """Mark tile 3 as paused — writes 'paused' to col H."""
-    _write_todo_status(item.document_1, "paused")
+    """Mark a Pause=1 item as drafted+awaiting human review. Writes to col J.
+
+    Status is 'drafted, awaiting human action' so the next bot run skips it
+    (see SKIP_STATUSES in tile3_invoicing.run). Orange so it visually stands
+    apart from green ('done'), red ('error'), and yellow ('bot working now').
+    """
+    _write_todo_status(item.document_1, "drafted, awaiting human action",
+                       color="orange")
 
 
 def mark_fully_done(item: InvoiceRow, pod_uploaded_1: str = "done",

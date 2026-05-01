@@ -546,52 +546,78 @@ def add_charge(driver: WebDriver, charge_type: str, amount: float, doc_number: s
     wait_for_page_ready(driver)
     take_screenshot(driver, f"tile3_charges_tab_open_{charge_type[:15]}")
 
-    # Click Add button for the correct freight doc section
-    # Each freight doc has its own "Add" button. Find the one near the target doc number.
+    # Scroll target freight doc section into view + expand if collapsed.
+    # Without this, leg 2's section may be off-screen / collapsed, causing the
+    # Add click to silently no-op (SAP shows "No changes are made" toast).
+    if doc_number:
+        scroll_result = driver.execute_script("""
+            var targetDoc = arguments[0];
+            // Find the section header element (small text containing the doc number)
+            var all = document.querySelectorAll('*');
+            var headerEl = null;
+            for (var i = 0; i < all.length; i++) {
+                var t = all[i].textContent.replace(/\\xAD/g, '').trim();
+                if ((t === 'Freight Document ' + targetDoc ||
+                     t === 'Freight Document' + targetDoc) && t.length < 50) {
+                    headerEl = all[i];
+                    break;
+                }
+            }
+            if (!headerEl) return {found: false};
+
+            headerEl.scrollIntoView({block: 'center'});
+
+            // Find the closest expandable ancestor (aria-expanded attribute)
+            var expandable = headerEl.closest('[aria-expanded]');
+            if (expandable && expandable.getAttribute('aria-expanded') === 'false') {
+                expandable.click();
+                return {found: true, expanded: true};
+            }
+            return {found: true, expanded: false};
+        """, doc_number)
+        log.info("Section %s: %s", doc_number, scroll_result)
+        if scroll_result and scroll_result.get('expanded'):
+            _time.sleep(1.5)  # let SAP render the now-expanded section
+            wait_for_page_ready(driver)
+
+    # Find Add button for the target freight doc section.
+    # Strategy: find every button whose text is exactly "Add", walk up from each,
+    # and pick the one whose CLOSEST "Freight Document <NNN>" ancestor matches
+    # the target doc. This avoids the old "first button in subtree" heuristic
+    # which was fragile (hitting collapse arrows, trash icons, leg-1 buttons).
     add_btn = driver.execute_script("""
         var targetDoc = arguments[0];
 
-        if (targetDoc) {
-            // Find all sections/headers containing the freight doc number
-            var all = document.querySelectorAll('*');
-            for (var i = 0; i < all.length; i++) {
-                // offsetParent check removed — unreliable in headless
-                var t = all[i].textContent.replace(/\\xAD/g, '').trim();
-                // Match "Freight Document <number>" header
-                if (t.indexOf('Freight Document') !== -1 && t.indexOf(targetDoc) !== -1 && t.length < 100) {
-                    // Find the "Add" button within this section's parent
-                    var parent = all[i];
-                    for (var j = 0; j < 10 && parent; j++) {
-                        var addBtn = parent.querySelector('button');
-                        if (addBtn) {
-                            var bt = addBtn.textContent.replace(/\\xAD/g, '').trim();
-                            if (bt.indexOf('Add') !== -1) return addBtn;
-                        }
-                        // Check siblings too
-                        var sibling = parent.nextElementSibling;
-                        while (sibling) {
-                            var btn = sibling.querySelector('button');
-                            if (btn) {
-                                var st = btn.textContent.replace(/\\xAD/g, '').trim();
-                                if (st.indexOf('Add') !== -1) return btn;
-                            }
-                            sibling = sibling.nextElementSibling;
-                        }
-                        parent = parent.parentElement;
+        // Collect every button whose text is exactly "Add"
+        var addButtons = [];
+        var allBtns = document.querySelectorAll('button');
+        for (var i = 0; i < allBtns.length; i++) {
+            var t = allBtns[i].textContent.replace(/\\xAD/g, '').trim();
+            if (t === 'Add') addButtons.push(allBtns[i]);
+        }
+
+        if (targetDoc && addButtons.length > 0) {
+            // For each Add button, walk up looking for "Freight Document <10digits>"
+            // in an ancestor's text. The CLOSEST match determines its section.
+            var pattern = /Freight Document\\s*(\\d{10})/;
+            for (var k = 0; k < addButtons.length; k++) {
+                var ancestor = addButtons[k].parentElement;
+                for (var m = 0; m < 15 && ancestor; m++) {
+                    var ancestorText = ancestor.textContent.replace(/\\xAD/g, '');
+                    var match = ancestorText.match(pattern);
+                    if (match) {
+                        if (match[1] === targetDoc) return addButtons[k];
+                        break;  // wrong section — try next Add button
                     }
+                    ancestor = ancestor.parentElement;
                 }
             }
         }
 
-        // Fallback: if no doc_number specified or not found, use the last visible Add button
-        var btns = document.querySelectorAll('button');
-        var lastAdd = null;
-        for (var i = 0; i < btns.length; i++) {
-            // offsetParent check removed — unreliable in headless
-            var t = btns[i].textContent.replace(/\\xAD/g, '').trim();
-            if (t === 'Add') lastAdd = btns[i];
-        }
-        return lastAdd;
+        // Fallback (single-doc invoice or doc_number not supplied):
+        // last "Add" button on page (rightmost/lowest in DOM)
+        if (addButtons.length > 0) return addButtons[addButtons.length - 1];
+        return null;
     """, doc_number)
     if add_btn:
         try:
@@ -1344,10 +1370,12 @@ def run(driver: WebDriver, *, dry_run: bool = False, step_through: bool = False,
         log.info("No items in To Do tab — nothing to invoice")
         return {"submitted": 0, "errors": 0}
 
-    # Skip rows whose col J is exactly "invoiced" (already done) or "wait"
-    # (manually marked by user as not-yet-ready). Lets the user leave half-done
-    # or future items on the To Do tab without bot re-processing them.
-    SKIP_STATUSES = {"invoiced", "wait"}
+    # Skip rows whose col J is exactly "invoiced" (already done), "wait"
+    # (manually marked by user as not-yet-ready), or "drafted, awaiting human
+    # action" (Pause=1 row already saved as draft for human review). Lets the
+    # user leave half-done or pending items on the To Do tab without bot
+    # re-processing them.
+    SKIP_STATUSES = {"invoiced", "wait", "drafted, awaiting human action"}
     skipped = [r for r in rows if r.tile3_status.strip().lower() in SKIP_STATUSES]
     if skipped:
         log.info("Skipping %d rows by col J status: %s",
@@ -1410,6 +1438,8 @@ def run(driver: WebDriver, *, dry_run: bool = False, step_through: bool = False,
                 mark_tile3_done(row)
             elif draft_status == "paused":
                 results["paused"] += 1
+                mark_tile3_paused(row)
+                log.info("Paused item saved via draft recovery — marked in To Do")
             elif draft_status == "dry_run":
                 results["skipped"] += 1
             else:
