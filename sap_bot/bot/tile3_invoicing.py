@@ -33,10 +33,16 @@ BACK_BUTTON = (By.CSS_SELECTOR,
 )
 
 
-def navigate_to_tile(driver: WebDriver):
+def navigate_to_tile(driver: WebDriver, first_call: bool = False):
     """Click the Invoice Freight Documents tile and wait for it to actually load.
 
     Uses body text check (not offsetParent) for headless compatibility.
+
+    first_call: when True, runs an extra wait (up to 20s) for the filter widgets
+    AND tab counts to fully load. Needed only on the very first navigation per
+    session because the page can pass the body-text check before the data layer
+    is interactive — that caused the "first item: not found in All tab" bug.
+    Subsequent calls skip this wait for speed.
     """
     click_tile(driver, TILE_NAME)
     from selenium.webdriver.support.ui import WebDriverWait
@@ -63,6 +69,17 @@ def navigate_to_tile(driver: WebDriver):
         click_tile(driver, TILE_NAME)
         _time.sleep(15)
     wait_for_page_ready(driver)
+
+    # FIRST-ITEM FIX (only on first navigate_to_tile per session): the body-
+    # text check above passes before the filter widgets are interactive. A
+    # smart-wait checking for filter input + tab count was tried but never
+    # actually returned true within its 20s window (always timed out). Replaced
+    # with a fixed 7s sleep — empirically enough for SAP to finish initializing
+    # the filter widgets on a cold page load. Subsequent navigations skip this.
+    if first_call:
+        _time.sleep(7)
+        log.info("First-call cushion (7s) complete — filter widgets should be interactive")
+
     take_screenshot(driver, "tile3_page_loaded")
     log.info("Tile 3 page loaded")
 
@@ -561,10 +578,74 @@ def add_charge(driver: WebDriver, charge_type: str, amount: float,
     # For leg 1: do NOT scroll. Leg 1's Add button is already visible at the
     # top of the page when the Charges tab opens. Scrolling would push it out
     # of frame.
+    # For leg 2: SAP's scroll on this page is broken (strobes/snaps back even
+    # for human users — confirmed by user observation). Instead of scrolling
+    # to reach leg 2's Add button at the bottom, we COLLAPSE leg 1's section
+    # to compress the page so leg 2 rises near the top (recreating the
+    # pre-SAP-config-change layout where leg 2 was naturally close to top
+    # before the 5 "Excluded Charge" rows were added). Leg 2 then sits well
+    # above the sticky Save bar and clicks normally without scrolling.
     if leg_num == 2:
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        _time.sleep(0.5)
-        log.info("Scrolled to page bottom for leg 2 charge add")
+        # Collapse non-target freight doc sections so leg 2 rises near the top
+        # of the page. The toggle is the treeicon <span> in each freight doc
+        # header row's first cell. JS .click() didn't work — SAP UI5 tree icons
+        # need real mouse events or keyboard activation. Use ActionChains.
+        from selenium.webdriver.common.keys import Keys
+
+        # Get list of non-target treeicon Selenium elements
+        treeicons = driver.execute_script("""
+            var targetDoc = arguments[0];
+            var pattern = /Freight Document\\s*(\\d{10})/;
+            var seen = {};
+            var icons = [];
+            var rows = document.querySelectorAll('tr[id*="chargesFlatTable-rows-row"]');
+            for (var i = 0; i < rows.length; i++) {
+                var firstCell = rows[i].querySelector('td');
+                if (!firstCell) continue;
+                var t = firstCell.textContent.replace(/\\xAD/g, '').trim();
+                var m = t.match(pattern);
+                if (!m || seen[m[1]]) continue;
+                seen[m[1]] = true;
+                if (m[1] === targetDoc) continue;
+                var toggle = firstCell.querySelector('[id*="treeicon"]');
+                if (toggle) icons.push(toggle);
+            }
+            return icons;
+        """, doc_number)
+
+        for treeicon in treeicons:
+            tid = driver.execute_script("return arguments[0].id;", treeicon)
+            collapsed_ok = False
+            # Method 1: ActionChains real mouse click (SAP UI5 listens for tap)
+            try:
+                ActionChains(driver).move_to_element(treeicon).click().perform()
+                log.info("Collapse: ActionChains click on treeicon %s", tid)
+                collapsed_ok = True
+            except Exception as e:
+                log.warning("Collapse ActionChains failed: %s", e)
+                # Method 2: focus + Enter key (treeicon is focusable, tabindex=0)
+                try:
+                    treeicon.send_keys(Keys.ENTER)
+                    log.info("Collapse: sent Enter to treeicon %s", tid)
+                    collapsed_ok = True
+                except Exception as e2:
+                    log.warning("Collapse Enter key failed: %s", e2)
+                    # Method 3: dispatch full mousedown/mouseup/click sequence
+                    try:
+                        driver.execute_script("""
+                            var el = arguments[0];
+                            ['mousedown', 'mouseup', 'click'].forEach(function(type) {
+                                el.dispatchEvent(new MouseEvent(type, {
+                                    bubbles: true, cancelable: true, view: window
+                                }));
+                            });
+                        """, treeicon)
+                        log.info("Collapse: dispatched mouse event sequence to treeicon %s", tid)
+                        collapsed_ok = True
+                    except Exception as e3:
+                        log.error("All collapse methods failed for %s: %s", tid, e3)
+
+        _time.sleep(1.5)  # let SAP re-render after collapse
 
     # Find Add button for the target freight doc section.
     # Strategy: find every button whose text is exactly "Add", walk up from each,
@@ -606,17 +687,48 @@ def add_charge(driver: WebDriver, charge_type: str, amount: float,
         return null;
     """, doc_number)
     if add_btn:
-        # Click directly. For leg 1, the page wasn't scrolled — Add is already
-        # visible at top. For leg 2, we scrolled to the bottom above so Add
-        # is in the bottom-right area, just above the sticky Save bar (visible,
-        # not covered). If leg 2 happened to be already expanded (Add high on
-        # page), the doc-aware crawler still picked the right button; native
-        # click + Selenium's auto-scroll handles that case.
+        # Verify Add button is reachable (not behind sticky Save bar) BEFORE
+        # clicking. If the verify shows we'd hit the wrong element, abort
+        # rather than click blindly and corrupt SAP state (last time the
+        # blind click landed on Storage in Transit's row, opening a side
+        # detail panel and producing misleading errors).
+        verify = driver.execute_script("""
+            var addBtn = arguments[0];
+            var r = addBtn.getBoundingClientRect();
+            var cx = r.left + r.width / 2;
+            var cy = r.top + r.height / 2;
+            var elAtPoint = document.elementFromPoint(cx, cy);
+            var hit = elAtPoint && (elAtPoint === addBtn || addBtn.contains(elAtPoint));
+            return {
+                btnTop: Math.round(r.top),
+                clickHitsAddBtn: !!hit,
+                elementAtClickPoint: elAtPoint ? {
+                    tag: elAtPoint.tagName,
+                    text: (elAtPoint.textContent || '').replace(/\\xAD/g, '').trim().substring(0, 40)
+                } : null
+            };
+        """, add_btn)
+        log.info("Add btn click target verification: %s", verify)
+
+        if not verify.get('clickHitsAddBtn'):
+            log.error("Add button is NOT reachable — collapse must have failed. "
+                      "Aborting leg %d add to avoid clicking the wrong element. "
+                      "elementAtClickPoint=%s", leg_num, verify.get('elementAtClickPoint'))
+            take_screenshot(driver, f"tile3_add_unreachable_{charge_type[:15]}")
+            return False
+
+        # Click — Add is verified reachable
         try:
-            add_btn.click()
-        except Exception:
             ActionChains(driver).move_to_element(add_btn).click().perform()
-        log.info("Clicked Add → new blank charge row")
+            log.info("Clicked Add (ActionChains) → new blank charge row")
+        except Exception as e:
+            log.warning("ActionChains click failed: %s — falling back", e)
+            try:
+                add_btn.click()
+                log.info("Clicked Add (native) → new blank charge row")
+            except Exception:
+                driver.execute_script("arguments[0].click();", add_btn)
+                log.info("Clicked Add (JS) → new blank charge row")
         _time.sleep(1)
         wait_for_page_ready(driver)
     else:
@@ -1386,7 +1498,7 @@ def run(driver: WebDriver, *, dry_run: bool = False, step_through: bool = False,
         log.info("No items to process")
         return results
 
-    navigate_to_tile(driver)
+    navigate_to_tile(driver, first_call=True)
 
     # Process all items (active first, then paused)
     all_to_process = active_rows + paused_rows
