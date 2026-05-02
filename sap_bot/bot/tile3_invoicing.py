@@ -505,8 +505,14 @@ def enter_invoice_number(driver: WebDriver, invoice_num: str):
         take_screenshot(driver, "tile3_invoice_input_missing")
 
 
-def add_charge(driver: WebDriver, charge_type: str, amount: float, doc_number: str = "") -> bool:
+def add_charge(driver: WebDriver, charge_type: str, amount: float,
+               doc_number: str = "", leg_num: int = 1) -> bool:
     """Add a charge in the Charges tab for a specific freight document.
+
+    leg_num: 1 = leg 1 (top of page, no scroll needed). 2 = leg 2 (typically
+    collapsed at the bottom of the page; we scroll to the extreme bottom so
+    leg 2's Add button is revealed just above the sticky Save bar, instead of
+    being hidden under it).
 
     Returns True if the charge category was selected AND the amount was entered.
     Returns False on any failure (Charges tab missing, Add btn missing, category
@@ -546,39 +552,19 @@ def add_charge(driver: WebDriver, charge_type: str, amount: float, doc_number: s
     wait_for_page_ready(driver)
     take_screenshot(driver, f"tile3_charges_tab_open_{charge_type[:15]}")
 
-    # Scroll target freight doc section into view + expand if collapsed.
-    # Without this, leg 2's section may be off-screen / collapsed, causing the
-    # Add click to silently no-op (SAP shows "No changes are made" toast).
-    if doc_number:
-        scroll_result = driver.execute_script("""
-            var targetDoc = arguments[0];
-            // Find the section header element (small text containing the doc number)
-            var all = document.querySelectorAll('*');
-            var headerEl = null;
-            for (var i = 0; i < all.length; i++) {
-                var t = all[i].textContent.replace(/\\xAD/g, '').trim();
-                if ((t === 'Freight Document ' + targetDoc ||
-                     t === 'Freight Document' + targetDoc) && t.length < 50) {
-                    headerEl = all[i];
-                    break;
-                }
-            }
-            if (!headerEl) return {found: false};
-
-            headerEl.scrollIntoView({block: 'center'});
-
-            // Find the closest expandable ancestor (aria-expanded attribute)
-            var expandable = headerEl.closest('[aria-expanded]');
-            if (expandable && expandable.getAttribute('aria-expanded') === 'false') {
-                expandable.click();
-                return {found: true, expanded: true};
-            }
-            return {found: true, expanded: false};
-        """, doc_number)
-        log.info("Section %s: %s", doc_number, scroll_result)
-        if scroll_result and scroll_result.get('expanded'):
-            _time.sleep(1.5)  # let SAP render the now-expanded section
-            wait_for_page_ready(driver)
+    # For leg 2: scroll page to extreme bottom so leg 2's section + Add button
+    # are revealed. Leg 2 is typically collapsed by default — that's fine,
+    # clicking its Add button will auto-expand it. Without this scroll, leg 2's
+    # Add button can be hidden under SAP's sticky Save/Submit/Cancel footer
+    # bar, and the click would land on Save (triggering "Document saved" toast
+    # instead of opening the Add dropdown).
+    # For leg 1: do NOT scroll. Leg 1's Add button is already visible at the
+    # top of the page when the Charges tab opens. Scrolling would push it out
+    # of frame.
+    if leg_num == 2:
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        _time.sleep(0.5)
+        log.info("Scrolled to page bottom for leg 2 charge add")
 
     # Find Add button for the target freight doc section.
     # Strategy: find every button whose text is exactly "Add", walk up from each,
@@ -620,9 +606,13 @@ def add_charge(driver: WebDriver, charge_type: str, amount: float, doc_number: s
         return null;
     """, doc_number)
     if add_btn:
+        # Click directly. For leg 1, the page wasn't scrolled — Add is already
+        # visible at top. For leg 2, we scrolled to the bottom above so Add
+        # is in the bottom-right area, just above the sticky Save bar (visible,
+        # not covered). If leg 2 happened to be already expanded (Add high on
+        # page), the doc-aware crawler still picked the right button; native
+        # click + Selenium's auto-scroll handles that case.
         try:
-            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", add_btn)
-            _time.sleep(0.3)
             add_btn.click()
         except Exception:
             ActionChains(driver).move_to_element(add_btn).click().perform()
@@ -1006,12 +996,12 @@ def fill_invoice_and_submit(driver: WebDriver, row: InvoiceRow,
 
     if row.has_charges_leg1:
         if not add_charge(driver, row.charge_type_1, row.charge_amount_1,
-                          doc_number=row.document_1):
+                          doc_number=row.document_1, leg_num=1):
             return f"error: failed to add leg 1 charge ({row.charge_type_1})"
 
     if row.is_collective and row.has_charges_leg2:
         if not add_charge(driver, row.charge_type_2, row.charge_amount_2,
-                          doc_number=row.document_2):
+                          doc_number=row.document_2, leg_num=2):
             return f"error: failed to add leg 2 charge ({row.charge_type_2})"
 
     if row.pause:

@@ -390,6 +390,9 @@ def scheduler_loop_34():
 # ── Flask app ───────────────────────────────────────────────────────────────
 
 app = Flask(__name__)
+# Preserve dict insertion order in JSON responses (Flask's default sorts keys
+# alphabetically, which scrambled daily_totals into new→total→updated).
+app.json.sort_keys = False
 
 
 @app.route("/", methods=["GET"])
