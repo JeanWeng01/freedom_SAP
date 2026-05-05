@@ -33,6 +33,29 @@ BACK_BUTTON = (By.CSS_SELECTOR,
 )
 
 
+def _click_tile_with_retry(driver: WebDriver, tile_name: str):
+    """Click a launchpad tile with one retry on msedgedriver/urllib3 timeout.
+
+    Tile 3 specific: the bot's intermittent 120s `urllib3 ReadTimeoutError`
+    failures consistently happen during launchpad → tile click. Wrapping the
+    primary click_tile call with one retry-after-5s recovers from the transient
+    "browser hung for a bit" case. If both attempts fail, re-raises so the bot
+    exits as it did before this wrapper existed.
+
+    REVERSAL: delete this function and replace `_click_tile_with_retry(...)`
+    call sites with `click_tile(...)` to restore previous behavior.
+    """
+    from urllib3.exceptions import ReadTimeoutError
+    from selenium.common.exceptions import WebDriverException
+    try:
+        return click_tile(driver, tile_name)
+    except (ReadTimeoutError, WebDriverException) as e:
+        log.warning("click_tile('%s') failed: %s — retrying once after 5s",
+                    tile_name, str(e)[:100])
+        _time.sleep(5)
+        return click_tile(driver, tile_name)  # if this also fails, propagate
+
+
 def navigate_to_tile(driver: WebDriver, first_call: bool = False):
     """Click the Invoice Freight Documents tile and wait for it to actually load.
 
@@ -44,7 +67,7 @@ def navigate_to_tile(driver: WebDriver, first_call: bool = False):
     is interactive — that caused the "first item: not found in All tab" bug.
     Subsequent calls skip this wait for speed.
     """
-    click_tile(driver, TILE_NAME)
+    _click_tile_with_retry(driver, TILE_NAME)
     from selenium.webdriver.support.ui import WebDriverWait
     try:
         WebDriverWait(driver, 30).until(
@@ -1139,7 +1162,7 @@ def fill_invoice_and_submit(driver: WebDriver, row: InvoiceRow,
 
 def navigate_to_manage_invoices(driver: WebDriver):
     """Navigate to the Manage Invoices tile."""
-    click_tile(driver, "Manage Invoices")
+    _click_tile_with_retry(driver, "Manage Invoices")
     from selenium.webdriver.support.ui import WebDriverWait
     try:
         WebDriverWait(driver, 30).until(
