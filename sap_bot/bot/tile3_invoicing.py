@@ -1262,7 +1262,13 @@ def click_into_draft_row(driver: WebDriver) -> bool:
         for (var i = 0; i < rows.length; i++) {
             if (rows[i].closest('thead')) continue;
             if (rows[i].classList.contains('sapMListTblHeader')) continue;
-            if (rows[i].textContent.trim().length > 0) dataRows.push(rows[i]);
+            // Skip SAP group-header rows (the grey "Freight Document: ..." bar)
+            if (rows[i].classList.contains('sapMGHLI')) continue;
+            if (rows[i].classList.contains('sapMGroupHeaderListItem')) continue;
+            var txt = rows[i].textContent.trim();
+            if (txt.length === 0) continue;
+            if (/^Freight Document:/i.test(txt)) continue;
+            dataRows.push(rows[i]);
         }
         return dataRows.length > 0 ? dataRows[0] : null;
     """)
