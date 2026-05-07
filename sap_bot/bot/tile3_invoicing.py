@@ -1319,38 +1319,76 @@ def filter_in_manage_invoices(driver: WebDriver, doc1: str, doc2: str = None):
     wait_for_page_ready(driver)
 
 
-def click_into_draft_row(driver: WebDriver) -> bool:
-    """Click into the first visible row in the Drafts list (native click on a safe cell)."""
-    row_el = driver.execute_script("""
+def click_into_draft_row(driver: WebDriver, expected_docs: list) -> bool:
+    """Click into the first visible row in the Drafts list, but ONLY if its
+    Freight Document column text contains at least one of the expected doc
+    numbers. Aborts with no click on mismatch — guards against opening the
+    wrong draft if the filter misbehaved (saw an incident on 2026-05-07
+    where bot opened 2505ROH-3 instead of HMP-2 and overwrote its invoice
+    number).
+
+    Note: the column shows only one doc + "..more" link for collective
+    invoices, so we check that ANY 10-digit number in the row matches ANY
+    expected doc. False-mismatches are extremely unlikely (doc numbers are
+    unique). False-matches require a wildcat coincidence.
+    """
+    result = driver.execute_script("""
+        var expected = arguments[0];
         var rows = document.querySelectorAll(
             '[role="row"].sapMListTblRow, .sapMListItems .sapMLIB, .sapMListTblRow'
         );
-        var dataRows = [];
+        var firstRow = null;
         for (var i = 0; i < rows.length; i++) {
             if (rows[i].closest('thead')) continue;
             if (rows[i].classList.contains('sapMListTblHeader')) continue;
-            // Skip SAP group-header rows (the grey "Freight Document: ..." bar)
             if (rows[i].classList.contains('sapMGHLI')) continue;
             if (rows[i].classList.contains('sapMGroupHeaderListItem')) continue;
             var txt = rows[i].textContent.trim();
             if (txt.length === 0) continue;
             if (/^Freight Document:/i.test(txt)) continue;
-            dataRows.push(rows[i]);
+            firstRow = rows[i];
+            break;
         }
-        return dataRows.length > 0 ? dataRows[0] : null;
-    """)
+        if (!firstRow) return {row: null, found: [], textSnippet: null};
+        var rowText = firstRow.textContent.replace(/\\xAD/g, '');
+        // Use digit lookarounds, not \b — SAP concatenates row text without
+        // spaces (e.g. "CAD6100202729,..more"), so word boundaries fail
+        // because letters and digits are both \w characters.
+        var docs = [];
+        var m, re = /(?<!\\d)(\\d{10})(?!\\d)/g;
+        while ((m = re.exec(rowText)) !== null) {
+            if (docs.indexOf(m[1]) === -1) docs.push(m[1]);
+        }
+        var match = false;
+        for (var j = 0; j < docs.length; j++) {
+            if (expected.indexOf(docs[j]) !== -1) { match = true; break; }
+        }
+        return {row: firstRow, found: docs, match: match, textSnippet: rowText.substring(0, 200)};
+    """, expected_docs)
 
-    if not row_el:
+    if not result or not result.get('row'):
         log.error("No draft rows found")
         take_screenshot(driver, "tile3_no_draft_rows")
         return False
 
+    found_docs = result.get('found', [])
+    log.info("First draft row docs found in column: %s | expected one of: %s",
+             found_docs, expected_docs)
+
+    if not result.get('match'):
+        log.error("DRAFT ROW MISMATCH — first row docs %s do NOT match any expected %s. "
+                  "Aborting click to avoid opening the wrong draft. Row text: %r",
+                  found_docs, expected_docs, result.get('textSnippet'))
+        take_screenshot(driver, f"tile3_draft_row_mismatch_{expected_docs[0]}")
+        return False
+
+    row_el = result['row']
     try:
         row_el.click()
-        log.info("Clicked into draft row (native)")
+        log.info("Clicked into draft row (native) — verified match")
     except Exception:
         ActionChains(driver).move_to_element(row_el).click().perform()
-        log.info("Clicked into draft row (ActionChains)")
+        log.info("Clicked into draft row (ActionChains) — verified match")
 
     _time.sleep(2)
     wait_for_page_ready(driver)
@@ -1391,9 +1429,16 @@ def process_drafted_invoice(driver: WebDriver, row: InvoiceRow,
 
         take_screenshot(driver, f"tile3_draft_filtered_{row.document_1}")
 
-        # Click into the draft
-        if not click_into_draft_row(driver):
-            return "error: draft invoice not found in Manage Invoices"
+        # Click into the draft — but verify the row's Freight Document column
+        # actually contains one of our target docs first. Without this guard,
+        # if the filter silently misbehaves (chips not cleared, send_keys lost
+        # focus, etc.), the bot would click the first row no matter what and
+        # then overwrite an unrelated draft's invoice number.
+        expected_docs = [row.document_1]
+        if row.is_collective and row.document_2:
+            expected_docs.append(row.document_2)
+        if not click_into_draft_row(driver, expected_docs):
+            return "error: draft row did not match expected docs (filter may have misbehaved — see screenshot)"
 
         take_screenshot(driver, f"tile3_draft_opened_{row.document_1}")
 
