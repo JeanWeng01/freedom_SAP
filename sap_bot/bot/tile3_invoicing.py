@@ -592,83 +592,150 @@ def add_charge(driver: WebDriver, charge_type: str, amount: float,
     wait_for_page_ready(driver)
     take_screenshot(driver, f"tile3_charges_tab_open_{charge_type[:15]}")
 
-    # For leg 2: scroll page to extreme bottom so leg 2's section + Add button
-    # are revealed. Leg 2 is typically collapsed by default — that's fine,
-    # clicking its Add button will auto-expand it. Without this scroll, leg 2's
-    # Add button can be hidden under SAP's sticky Save/Submit/Cancel footer
-    # bar, and the click would land on Save (triggering "Document saved" toast
-    # instead of opening the Add dropdown).
-    # For leg 1: do NOT scroll. Leg 1's Add button is already visible at the
-    # top of the page when the Charges tab opens. Scrolling would push it out
-    # of frame.
-    # For leg 2: SAP's scroll on this page is broken (strobes/snaps back even
-    # for human users — confirmed by user observation). Instead of scrolling
-    # to reach leg 2's Add button at the bottom, we COLLAPSE leg 1's section
-    # to compress the page so leg 2 rises near the top (recreating the
-    # pre-SAP-config-change layout where leg 2 was naturally close to top
-    # before the 5 "Excluded Charge" rows were added). Leg 2 then sits well
-    # above the sticky Save bar and clicks normally without scrolling.
-    if leg_num == 2:
-        # Collapse non-target freight doc sections so leg 2 rises near the top
-        # of the page. The toggle is the treeicon <span> in each freight doc
-        # header row's first cell. JS .click() didn't work — SAP UI5 tree icons
-        # need real mouse events or keyboard activation. Use ActionChains.
-        from selenium.webdriver.common.keys import Keys
+    # Collapse all non-target freight doc sections (regardless of which leg
+    # we're processing). Why: SAP can display freight docs in either order in
+    # the charges tab — filter results came back reversed after a SAP-side
+    # change, so gsheet's document_1 may end up at top OR bottom. Collapsing
+    # every non-target doc ensures the target's Add button is always reachable:
+    # if target is at top, the bottom collapses (no-op visually); if target is
+    # at bottom, the top collapses and target rises up. Single-doc invoices
+    # have no non-targets to collapse — the loop is a no-op.
+    #
+    # Mechanics: the toggle is the treeicon <span> in each freight doc header
+    # row's first cell. SAP UI5 tree icons need real mouse events or keyboard
+    # activation — JS .click() doesn't trigger their tap handler. ActionChains
+    # "succeeds" silently even when the click had no effect (anchor-bar
+    # snap-back during scroll), so we verify state after each method and only
+    # stop once collapse is confirmed.
+    from selenium.webdriver.common.keys import Keys
 
-        # Get list of non-target treeicon Selenium elements
-        treeicons = driver.execute_script("""
-            var targetDoc = arguments[0];
-            var pattern = /Freight Document\\s*(\\d{10})/;
-            var seen = {};
-            var icons = [];
-            var rows = document.querySelectorAll('tr[id*="chargesFlatTable-rows-row"]');
-            for (var i = 0; i < rows.length; i++) {
-                var firstCell = rows[i].querySelector('td');
-                if (!firstCell) continue;
-                var t = firstCell.textContent.replace(/\\xAD/g, '').trim();
-                var m = t.match(pattern);
-                if (!m || seen[m[1]]) continue;
-                seen[m[1]] = true;
-                if (m[1] === targetDoc) continue;
-                var toggle = firstCell.querySelector('[id*="treeicon"]');
-                if (toggle) icons.push(toggle);
+    # Diagnostic: dump multiple collapse-state signals so we can later
+    # determine empirically which one is reliable, and prune the rest.
+    _inspect_js = """
+        var doc = arguments[0];
+        var pattern = /Freight Document\\s*(\\d{10})/;
+        var rows = document.querySelectorAll('tr[id*="chargesFlatTable-rows-row"]');
+        var hdr = null, hdrIdx = -1;
+        for (var i = 0; i < rows.length; i++) {
+            var fc = rows[i].querySelector('td');
+            if (!fc) continue;
+            var t = fc.textContent.replace(/\\xAD/g, '').trim();
+            var m = t.match(pattern);
+            if (m && m[1] === doc) { hdr = rows[i]; hdrIdx = i; break; }
+        }
+        if (!hdr) return {found: false};
+        var icon = hdr.querySelector('[id*="treeicon"]');
+        var visibleChildren = 0;
+        for (var j = hdrIdx + 1; j < rows.length; j++) {
+            var fc2 = rows[j].querySelector('td');
+            if (fc2) {
+                var t2 = fc2.textContent.replace(/\\xAD/g, '').trim();
+                if (pattern.test(t2)) break;
             }
-            return icons;
-        """, doc_number)
+            var s = window.getComputedStyle(rows[j]);
+            if (s.display !== 'none' && s.visibility !== 'hidden') visibleChildren++;
+        }
+        return {
+            found: true,
+            rowId: hdr.id,
+            rowAriaExpanded: hdr.getAttribute('aria-expanded'),
+            iconAriaExpanded: icon ? icon.getAttribute('aria-expanded') : null,
+            iconClasses: icon ? icon.className : null,
+            visibleChildren: visibleChildren
+        };
+    """
 
-        for treeicon in treeicons:
-            tid = driver.execute_script("return arguments[0].id;", treeicon)
-            collapsed_ok = False
-            # Method 1: ActionChains real mouse click (SAP UI5 listens for tap)
+    def _inspect(doc):
+        return driver.execute_script(_inspect_js, doc)
+
+    def _is_collapsed(state):
+        if not state or not state.get('found'):
+            return False
+        if state.get('rowAriaExpanded') == 'false':
+            return True
+        if state.get('iconAriaExpanded') == 'false':
+            return True
+        if state.get('visibleChildren') == 0:
+            return True
+        return False
+
+    # Get list of non-target treeicon Selenium elements
+    treeicons = driver.execute_script("""
+        var targetDoc = arguments[0];
+        var pattern = /Freight Document\\s*(\\d{10})/;
+        var seen = {};
+        var icons = [];
+        var rows = document.querySelectorAll('tr[id*="chargesFlatTable-rows-row"]');
+        for (var i = 0; i < rows.length; i++) {
+            var firstCell = rows[i].querySelector('td');
+            if (!firstCell) continue;
+            var t = firstCell.textContent.replace(/\\xAD/g, '').trim();
+            var m = t.match(pattern);
+            if (!m || seen[m[1]]) continue;
+            seen[m[1]] = true;
+            if (m[1] === targetDoc) continue;
+            var toggle = firstCell.querySelector('[id*="treeicon"]');
+            if (toggle) icons.push(toggle);
+        }
+        return icons;
+    """, doc_number)
+
+    for treeicon in treeicons:
+        tid = driver.execute_script("return arguments[0].id;", treeicon)
+        non_doc = driver.execute_script("""
+            var pattern = /Freight Document\\s*(\\d{10})/;
+            var row = arguments[0].closest('tr');
+            if (!row) return null;
+            var fc = row.querySelector('td');
+            if (!fc) return null;
+            var m = fc.textContent.replace(/\\xAD/g, '').trim().match(pattern);
+            return m ? m[1] : null;
+        """, treeicon)
+
+        if not non_doc:
+            log.warning("Could not determine doc for treeicon %s — skipping", tid)
+            continue
+
+        before = _inspect(non_doc)
+        log.info("Collapse pre-state for doc %s: %s", non_doc, before)
+        if _is_collapsed(before):
+            log.info("Doc %s already collapsed — skipping", non_doc)
+            continue
+
+        methods = [
+            ("ActionChains", lambda: ActionChains(driver).move_to_element(treeicon).click().perform()),
+            ("Enter key",    lambda: treeicon.send_keys(Keys.ENTER)),
+            ("event dispatch", lambda: driver.execute_script("""
+                var el = arguments[0];
+                ['mousedown','mouseup','click'].forEach(function(type){
+                    el.dispatchEvent(new MouseEvent(type, {
+                        bubbles:true, cancelable:true, view:window
+                    }));
+                });
+            """, treeicon)),
+        ]
+
+        collapsed_ok = False
+        for name, fn in methods:
             try:
-                ActionChains(driver).move_to_element(treeicon).click().perform()
-                log.info("Collapse: ActionChains click on treeicon %s", tid)
-                collapsed_ok = True
+                fn()
+                log.info("Collapse method '%s' attempted on treeicon %s", name, tid)
             except Exception as e:
-                log.warning("Collapse ActionChains failed: %s", e)
-                # Method 2: focus + Enter key (treeicon is focusable, tabindex=0)
-                try:
-                    treeicon.send_keys(Keys.ENTER)
-                    log.info("Collapse: sent Enter to treeicon %s", tid)
-                    collapsed_ok = True
-                except Exception as e2:
-                    log.warning("Collapse Enter key failed: %s", e2)
-                    # Method 3: dispatch full mousedown/mouseup/click sequence
-                    try:
-                        driver.execute_script("""
-                            var el = arguments[0];
-                            ['mousedown', 'mouseup', 'click'].forEach(function(type) {
-                                el.dispatchEvent(new MouseEvent(type, {
-                                    bubbles: true, cancelable: true, view: window
-                                }));
-                            });
-                        """, treeicon)
-                        log.info("Collapse: dispatched mouse event sequence to treeicon %s", tid)
-                        collapsed_ok = True
-                    except Exception as e3:
-                        log.error("All collapse methods failed for %s: %s", tid, e3)
+                log.warning("Collapse method '%s' raised: %s", name, e)
+                continue
+            _time.sleep(0.8)
+            after = _inspect(non_doc)
+            log.info("Collapse post-state via '%s' for doc %s: %s", name, non_doc, after)
+            if _is_collapsed(after):
+                log.info("Collapse CONFIRMED via '%s' for doc %s", name, non_doc)
+                collapsed_ok = True
+                break
+            log.warning("Collapse method '%s' had no effect — trying next", name)
 
-        _time.sleep(1.5)  # let SAP re-render after collapse
+        if not collapsed_ok:
+            log.error("All collapse methods failed for non-target doc %s — still expanded", non_doc)
+
+    _time.sleep(0.7)  # final settle
 
     # Find Add button for the target freight doc section.
     # Strategy: find every button whose text is exactly "Add", walk up from each,
