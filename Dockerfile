@@ -1,23 +1,56 @@
-FROM python:3.13-slim
+FROM python:3.13-slim-bookworm
 
-# Install Chrome + dependencies
+# Pinned Chrome major. Bump after verifying compatibility on Railway.
+# Chrome + chromedriver are both fetched from Chrome for Testing for this major,
+# so versions stay in lockstep across rebuilds.
+ARG CHROME_MAJOR=140
+
+# Tooling + Chrome runtime dependencies (since we no longer install
+# google-chrome-stable via apt, its deps aren't pulled automatically).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
-    gnupg2 \
-    unzip \
     curl \
-    && wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg \
-    && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends google-chrome-stable \
+    unzip \
+    ca-certificates \
+    tzdata \
+    fonts-liberation \
+    libasound2 \
+    libatk-bridge2.0-0 \
+    libatk1.0-0 \
+    libatspi2.0-0 \
+    libcairo2 \
+    libcups2 \
+    libdbus-1-3 \
+    libdrm2 \
+    libgbm1 \
+    libgtk-3-0 \
+    libnspr4 \
+    libnss3 \
+    libpango-1.0-0 \
+    libvulkan1 \
+    libx11-6 \
+    libxcb1 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxext6 \
+    libxfixes3 \
+    libxkbcommon0 \
+    libxrandr2 \
+    libxshmfence1 \
+    libxss1 \
+    xdg-utils \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Install chromedriver matching the installed Chrome version (Chrome for Testing).
-# Baked into the image so Selenium Manager never has to download at runtime.
-RUN CHROME_MAJOR=$(google-chrome --version | awk '{print $3}' | cut -d. -f1) \
-    && DRIVER_VERSION=$(curl -fsSL "https://googlechromelabs.github.io/chrome-for-testing/LATEST_RELEASE_${CHROME_MAJOR}") \
-    && wget -q -O /tmp/chromedriver.zip "https://storage.googleapis.com/chrome-for-testing-public/${DRIVER_VERSION}/linux64/chromedriver-linux64.zip" \
+# Install Chrome + matching chromedriver from Chrome for Testing (pinned major).
+# Using the same source for both guarantees they match patch-version exactly.
+RUN CHROME_VERSION=$(curl -fsSL "https://googlechromelabs.github.io/chrome-for-testing/LATEST_RELEASE_${CHROME_MAJOR}") \
+    && echo "Installing Chrome/Chromedriver ${CHROME_VERSION}" \
+    && wget -q -O /tmp/chrome.zip "https://storage.googleapis.com/chrome-for-testing-public/${CHROME_VERSION}/linux64/chrome-linux64.zip" \
+    && unzip -q /tmp/chrome.zip -d /opt/ \
+    && ln -sf /opt/chrome-linux64/chrome /usr/local/bin/google-chrome \
+    && rm /tmp/chrome.zip \
+    && wget -q -O /tmp/chromedriver.zip "https://storage.googleapis.com/chrome-for-testing-public/${CHROME_VERSION}/linux64/chromedriver-linux64.zip" \
     && unzip -j /tmp/chromedriver.zip "chromedriver-linux64/chromedriver" -d /usr/local/bin/ \
     && chmod +x /usr/local/bin/chromedriver \
     && rm /tmp/chromedriver.zip \
@@ -31,9 +64,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy bot code
 COPY sap_bot/ .
-
-# Install timezone data for ET
-RUN apt-get update && apt-get install -y --no-install-recommends tzdata && rm -rf /var/lib/apt/lists/*
 
 # Railway sets PORT env var
 ENV HEADLESS=true
